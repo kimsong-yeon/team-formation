@@ -1,0 +1,16 @@
+# 비밀 값 (절대 커밋하지 않음)
+.env
+.streamlit/secrets.toml
+
+# Claude 데스크톱 앱이 만드는 폴더
+Claude outputs/
+
+# 파이썬 실행 부산물
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# 작업 도구 기록
+.superpowers/
