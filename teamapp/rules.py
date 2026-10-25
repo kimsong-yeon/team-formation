@@ -1,4 +1,4 @@
-"""팀 편성 규칙: 역할 상수, 학생, 필수 포함 역할 자리 계산.
+"""팀 편성 규칙: 역할 상수, 학생, 필수 포함 역할 자리 계산, 지원·투표·마감 판단.
 
 DB와 Streamlit에 의존하지 않는 순수 파이썬 모듈이다.
 판단은 역할과 규칙으로만 하고, 학생의 이름·학번·순서는 보지 않는다.
@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
 PLANNER = "기획자"
 WEB = "웹 프로그래머"
@@ -115,3 +116,187 @@ def seat_problem(members_after: Sequence[Student]) -> str | None:
             f"(남는 자리 {seats_left}개, 채워야 할 역할: {', '.join(unmet_roles(members_after))})"
         )
     return None
+
+
+@dataclass(frozen=True)
+class Application:
+    """팀에 낸 지원. status는 대기·승인·거절 가운데 하나."""
+
+    id: int
+    team_id: int
+    student_id: int
+    status: str
+    reason: str = ""
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class State:
+    """판단에 필요한 지금 상태(읽기 전용).
+
+    members: 팀 번호 -> 팀원 학생 id들, votes: 지원 id -> {투표자 id: 찬성/거부}.
+    """
+
+    students: dict[int, Student]
+    team_ids: tuple[int, ...]
+    members: dict[int, tuple[int, ...]]
+    applications: tuple[Application, ...]
+    votes: dict[int, dict[int, str]]
+    closed: bool
+
+    def team_name(self, team_id: int) -> str:
+        return f"팀{team_id}"
+
+    def team_of(self, student_id: int) -> int | None:
+        for team_id, ids in self.members.items():
+            if student_id in ids:
+                return team_id
+        return None
+
+    def team_members(self, team_id: int) -> list[Student]:
+        return [self.students[i] for i in self.members.get(team_id, ())]
+
+    def pending_of(self, student_id: int) -> Application | None:
+        for a in self.applications:
+            if a.student_id == student_id and a.status == PENDING:
+                return a
+        return None
+
+    def application(self, app_id: int) -> Application | None:
+        for a in self.applications:
+            if a.id == app_id:
+                return a
+        return None
+
+    def pending_for_team(self, team_id: int) -> list[Application]:
+        pending = [a for a in self.applications if a.team_id == team_id and a.status == PENDING]
+        return sorted(pending, key=lambda a: a.id)
+
+    def unassigned(self) -> list[Student]:
+        """팀이 없는 학생, 학번 순서."""
+        assigned = {i for ids in self.members.values() for i in ids}
+        free = [s for s in self.students.values() if s.id not in assigned]
+        return sorted(free, key=lambda s: s.student_no)
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """결과 안내. kind는 승인·대기·거절·막힘 가운데 하나."""
+
+    kind: str
+    message: str
+
+    @property
+    def text(self) -> str:
+        return f"{self.kind}: {self.message}"
+
+
+def apply_lock_reason(state: State, student_id: int) -> str | None:
+    """지원 단추를 모두 비활성화할 이유. 지원할 수 있으면 None.
+
+    검사 순서는 decide_apply와 같다: 마감 -> 팀 있음 -> 대기 지원 있음.
+    """
+    if state.closed:
+        return "모집이 마감되었습니다"
+    team_id = state.team_of(student_id)
+    if team_id is not None:
+        return f"이미 {state.team_name(team_id)}에 속해 있습니다"
+    pending = state.pending_of(student_id)
+    if pending is not None:
+        return (
+            f"{state.team_name(pending.team_id)}에 낸 지원이 대기 중입니다. "
+            f"결과가 나온 뒤 다시 지원할 수 있습니다"
+        )
+    return None
+
+
+def decide_apply(state: State, student_id: int, team_id: int) -> Outcome:
+    """지원 단추를 눌렀을 때의 결과. 막힘이면 아무것도 기록하지 않는다.
+
+    PRD 4.2절 순서: 마감 -> 이미 팀 있음 -> 대기 지원 있음 -> 정원 -> 주 역할 중복 -> 필수 역할 자리.
+    뒤의 셋은 seat_problem 하나가 그 순서로 판단한다.
+    """
+    if team_id not in state.team_ids:
+        return Outcome(BLOCKED, "없는 팀입니다")
+    if state.closed:
+        return Outcome(BLOCKED, "모집이 마감됨")
+    if state.team_of(student_id) is not None:
+        return Outcome(BLOCKED, "이미 팀이 있음")
+    if state.pending_of(student_id) is not None:
+        return Outcome(BLOCKED, "결과를 기다리는 지원이 있음")
+    members = state.team_members(team_id)
+    problem = seat_problem(members + [state.students[student_id]])
+    if problem is not None:
+        return Outcome(BLOCKED, problem)
+    if not members:
+        return Outcome(APPROVED, "빈 팀이라 바로 승인되었습니다")
+    return Outcome(PENDING, "지원했습니다. 팀원 모두의 투표를 기다립니다")
+
+
+@dataclass(frozen=True)
+class VoteDecision:
+    """투표 판단. record_vote가 True일 때만 표를 기록하고,
+    final_status가 있으면 지원을 그 상태(승인/거절)로 확정한다."""
+
+    outcome: Outcome
+    record_vote: bool
+    final_status: str | None
+
+
+def decide_vote(state: State, application_id: int, voter_id: int, vote: str) -> VoteDecision:
+    """투표 한 표의 결과. state는 이번 표를 넣기 전 상태이다."""
+
+    def no_record(kind: str, message: str) -> VoteDecision:
+        return VoteDecision(Outcome(kind, message), False, None)
+
+    app = state.application(application_id)
+    if app is None:
+        return no_record(BLOCKED, "없는 지원입니다")
+    # 이미 결과가 나온 지원은 지금 상태를 알려 준다.
+    if app.status == APPROVED:
+        return no_record(APPROVED, "이미 승인된 지원입니다")
+    if app.status == REJECTED:
+        return no_record(REJECTED, "이미 거절된 지원입니다")
+    if state.closed:
+        return no_record(BLOCKED, "모집이 마감됨")
+    if voter_id not in state.members.get(app.team_id, ()):
+        return no_record(BLOCKED, "이 팀의 팀원만 투표할 수 있습니다")
+    if voter_id in state.votes.get(app.id, {}):
+        return no_record(PENDING, "이미 투표했습니다. 다른 팀원의 투표를 기다립니다")
+    if vote not in (YES, NO):
+        return no_record(BLOCKED, "투표는 찬성이나 거부만 할 수 있습니다")
+
+    if vote == NO:
+        return VoteDecision(Outcome(REJECTED, "거부하여 지원이 거절되었습니다"), True, REJECTED)
+
+    # 지금 팀원이 아닌 사람의 표는 세지 않는다. 이번 찬성을 더해 지금 팀원 전원이 찬성했는지 본다.
+    yes_voters = {v for v, value in state.votes.get(app.id, {}).items() if value == YES}
+    yes_voters.add(voter_id)
+    if all(member_id in yes_voters for member_id in state.members[app.team_id]):
+        # 승인하기 직전에 지금 팀 구성으로 규칙을 다시 검사한다.
+        problem = seat_problem(state.team_members(app.team_id) + [state.students[app.student_id]])
+        if problem is None:
+            return VoteDecision(Outcome(APPROVED, "팀원 모두 찬성하여 승인되었습니다"), True, APPROVED)
+        message = f"승인 직전 검사에서 규칙에 맞지 않습니다 ({problem})"
+        return VoteDecision(Outcome(REJECTED, message), True, REJECTED)
+    return VoteDecision(Outcome(PENDING, "찬성했습니다. 다른 팀원의 투표를 기다립니다"), True, None)
+
+
+def decide_close(state: State) -> tuple[Outcome, tuple[int, ...], tuple[int, ...]]:
+    """모집 마감 결과: (안내, 거절할 대기 지원 id들, 팀에서 뺄 학생 id들).
+
+    대기 지원은 모두 거절하고(지원 id 순서), 1명뿐인 팀의 학생은 팀에서 뺀다(팀 번호 순서).
+    """
+    if state.closed:
+        return Outcome(BLOCKED, "이미 마감되었습니다"), (), ()
+    pending = sorted((a for a in state.applications if a.status == PENDING), key=lambda a: a.id)
+    rejected = tuple(a.id for a in pending)
+    removed = tuple(
+        state.members[team_id][0]
+        for team_id in sorted(state.members)
+        if len(state.members[team_id]) == 1
+    )
+    applicants = ", ".join(state.students[a.student_id].name for a in pending) or "없음"
+    removed_names = ", ".join(state.students[i].name for i in removed) or "없음"
+    message = f"모집을 마감했습니다. 거절한 지원: {applicants} · 팀에서 뺀 학생: {removed_names}"
+    return Outcome(APPROVED, message), rejected, removed
