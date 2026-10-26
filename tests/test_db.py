@@ -2,14 +2,16 @@
 
 - psycopg2가 없거나, .env(또는 환경 변수)에 DATABASE_URL이나 ADMIN_PASSWORD가 없으면 모듈 전체를 건너뛴다.
 - 주의: DATABASE_URL이 가리키는 DB의 tf_ 데이터(관리자를 뺀 학생, 팀, 팀원, 지원, 투표, 마감 표시)를 지우고
-  연습용 명단을 다시 올린다. 관리자 계정은 남고, 비밀번호 해시는 ADMIN_PASSWORD에 맞춘다.
+  연습용 명단을 다시 올린다. 관리자 계정은 남는다. 테스트하는 동안 관리자 비밀번호 해시를 로컬 ADMIN_PASSWORD에
+  맞추고, 끝나면 테스트 전 해시로 되돌린다(배포한 앱의 관리자 비밀번호가 바뀌지 않도록. 해시는 출력하지 않음).
   끝나면 쉬움 명단(팀 3개, 학생 비밀번호 1234를 bcrypt로 해시)으로 처음 상태를 만들어 둔다.
-  그래서 배포한 앱으로 시험하는 도중에는 돌리지 않는다. 로컬 .env와 Streamlit Secrets의 ADMIN_PASSWORD는 같아야 한다.
+  그래서 배포한 앱으로 시험하는 도중에는 돌리지 않는다.
 - 실행(수강생 컴퓨터): .venv\\Scripts\\python -m unittest tests.test_db -v
 """
 import threading
 import time
 import unittest
+from unittest import mock
 
 from teamapp import actions, config
 from teamapp.passwords import hash_password, verify_password
@@ -45,10 +47,11 @@ TABLES = (
 
 POOL = None
 ADMIN_PASSWORD = None
+SAVED_ADMIN_HASH = None  # 테스트 전 관리자 비밀번호 해시(관리자가 없었으면 None). 출력하지 않는다
 
 
 def setUpModule():
-    global POOL, ADMIN_PASSWORD
+    global POOL, ADMIN_PASSWORD, SAVED_ADMIN_HASH
     if psycopg2 is None:
         raise unittest.SkipTest("psycopg2가 설치되어 있지 않음")
     dsn = config.get_secret("DATABASE_URL")
@@ -60,6 +63,7 @@ def setUpModule():
     POOL = db.make_pool(dsn)
     try:
         db.ensure_schema(POOL, db.read_schema_sql())
+        SAVED_ADMIN_HASH = admin_hash()  # ensure_admin이 바꾸기 전에 기억해 둔다
         db.ensure_admin(POOL, ADMIN_PASSWORD)
     except BaseException:
         POOL.closeall()
@@ -68,7 +72,7 @@ def setUpModule():
 
 
 def tearDownModule():
-    global POOL
+    global POOL, SAVED_ADMIN_HASH
     if POOL is None:
         return
     try:
@@ -76,8 +80,24 @@ def tearDownModule():
         if bcrypt is not None:
             reset(EASY.csv_name, EASY.team_count, hasher=hash_password)
     finally:
-        POOL.closeall()
-        POOL = None
+        try:
+            if SAVED_ADMIN_HASH is not None:  # 관리자 비밀번호 해시를 테스트 전으로 되돌린다
+                with db.connection(POOL) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "update tf_students set password_hash = %s where student_no = %s",
+                            (SAVED_ADMIN_HASH, ADMIN_NO),
+                        )
+                    conn.commit()
+        finally:
+            SAVED_ADMIN_HASH = None
+            POOL.closeall()
+            POOL = None
+
+
+def admin_hash():
+    rows = query("select password_hash from tf_students where student_no = %s", (ADMIN_NO,))
+    return rows[0][0] if rows else None
 
 
 def reset(csv_name="쉬움.csv", team_count=3, hasher=fake_hash):
@@ -307,7 +327,7 @@ class ConnectionTests(unittest.TestCase):
                 victim_pid = cur.fetchone()[0]
             victim.rollback()
         finally:
-            POOL.putconn(victim)  # 풀에 남는다(최소 1개)
+            POOL.putconn(victim)  # 쉬는 연결로 풀에 남고, 다음에 가장 먼저 꺼내진다
         try:
             with killer.cursor() as cur:
                 cur.execute("select pg_terminate_backend(%s, 5000)", (victim_pid,))  # 끝날 때까지 최대 5초 기다림
@@ -320,6 +340,22 @@ class ConnectionTests(unittest.TestCase):
                 cur.execute("select pg_backend_pid()")
                 self.assertNotEqual(cur.fetchone()[0], victim_pid)
         self.assertEqual(self.select_one(), 1)
+
+    def test_returned_connections_are_reused(self):
+        """겹쳐 쓴 연결 세 개를 돌려준 뒤 다시 세 개를 겹쳐 써도 새로 접속하지 않는다(같은 서버 backend)."""
+
+        def pids():
+            with db.connection(POOL) as a, db.connection(POOL) as b, db.connection(POOL) as c:
+                result = set()
+                for conn in (a, b, c):
+                    with conn.cursor() as cur:
+                        cur.execute("select pg_backend_pid()")
+                        result.add(cur.fetchone()[0])
+                return result
+
+        first = pids()
+        self.assertEqual(len(first), 3)
+        self.assertEqual(pids(), first)
 
 
 class RepoTests(unittest.TestCase):
@@ -418,6 +454,54 @@ class RepoTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             with db.write_repo(POOL) as repo:
                 repo.set_application_status(10**12, REJECTED, "없는 지원")
+
+    def test_swallowed_db_error_is_rolled_back_not_committed(self):
+        _, ids = reset()
+        with self.assertRaises(psycopg2.InternalError):
+            with db.write_repo(POOL) as repo:
+                repo.set_closed()
+                repo.add_member(1, ids["학생1(PL;RW)"])
+                try:
+                    repo.add_member(2, ids["학생1(PL;RW)"])  # 이미 팀이 있음: 유일성 제약
+                except psycopg2.IntegrityError:
+                    pass  # 잡고 넘어가도 트랜잭션은 오류 상태이다
+        state = read_state()
+        self.assertFalse(state.closed)
+        self.assertEqual(state.members, {1: (), 2: (), 3: ()})
+
+    def test_writer_gives_up_after_lock_timeout(self):
+        """잠금을 쥔 쓰기가 멈춰 있으면 다른 쓰기는 LOCK_TIMEOUT 뒤 오류(55P03)로 끝나고 아무것도 쓰지 않는다."""
+        reset()
+        holding = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def stalled_writer():
+            try:
+                with db.write_repo(POOL):
+                    holding.set()
+                    release.wait(30)
+            except BaseException as error:
+                errors.append(error)
+                holding.set()
+
+        thread = threading.Thread(target=stalled_writer)
+        thread.start()
+        try:
+            self.assertTrue(holding.wait(30))
+            with mock.patch.object(db, "LOCK_TIMEOUT", "300ms"):
+                started = time.monotonic()
+                with self.assertRaises(psycopg2.OperationalError) as caught:
+                    with db.write_repo(POOL) as repo:
+                        repo.set_closed()
+                waited = time.monotonic() - started
+        finally:
+            release.set()
+            thread.join(60)
+        self.assertEqual(errors, [])
+        self.assertEqual(caught.exception.pgcode, "55P03")  # lock_not_available
+        self.assertLess(waited, 10)
+        self.assertFalse(read_state().closed)
 
     def test_write_repo_serializes_writers(self):
         """두 쓰기가 겹치면 뒤의 쓰기는 앞의 쓰기가 commit될 때까지 잠금에서 기다리고, 그 뒤의 상태를 읽는다."""

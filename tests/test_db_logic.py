@@ -1,10 +1,12 @@
-"""DB 없이 확인하는 DB 저장소(teamapp/db.py)의 연결·트랜잭션 처리와 상태 변환.
+"""DB 없이 확인하는 DB 저장소(teamapp/db.py)의 연결 풀·연결·트랜잭션 처리와 상태 변환.
 
-가짜 psycopg2(연결, 커서, 풀)를 넣어 teamapp/db.py를 다른 이름으로 따로 불러온다(진짜 teamapp.db는 건드리지 않음).
-실제 SQL은 tests/test_db.py가 진짜 DB로 확인한다.
+가짜 psycopg2(연결, 커서)를 넣어 teamapp/db.py를 다른 이름으로 따로 불러온다(진짜 teamapp.db는 건드리지 않음).
+가짜의 연결 풀은 psycopg2 2.9의 lib/pool.py와 같은 방식(쉬는 연결 목록 _pool, 쓰는 연결 _used/_rused,
+minconn개까지만 쉬게 두는 _putconn)으로 옮겨 적었다. 실제 SQL은 tests/test_db.py가 진짜 DB로 확인한다.
 """
 import importlib.util
 import sys
+import threading
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -17,6 +19,8 @@ from teamapp.rules import Application, State, Student
 
 DB_PATH = Path(__file__).resolve().parent.parent / "teamapp" / "db.py"
 
+IDLE, ACTIVE, INTRANS, INERROR, UNKNOWN = range(5)  # psycopg2.extensions.TRANSACTION_STATUS_*
+
 
 def make_fake_psycopg2():
     pg = types.ModuleType("psycopg2")
@@ -25,11 +29,116 @@ def make_fake_psycopg2():
     pg.DatabaseError = type("DatabaseError", (pg.Error,), {})
     pg.OperationalError = type("OperationalError", (pg.DatabaseError,), {})
     pg.ProgrammingError = type("ProgrammingError", (pg.DatabaseError,), {})
-    pg.pool = types.ModuleType("psycopg2.pool")
-    pg.pool.PoolError = type("PoolError", (pg.Error,), {})
-    pg.pool.AbstractConnectionPool = object
-    pg.pool.ThreadedConnectionPool = mock.Mock(name="ThreadedConnectionPool")
-    pg.extensions = types.ModuleType("psycopg2.extensions")
+    pg.IntegrityError = type("IntegrityError", (pg.DatabaseError,), {})
+    pg.InternalError = type("InternalError", (pg.DatabaseError,), {})
+    pg.connect = lambda *args, **kwargs: pg.connect_factory(*args, **kwargs)  # 테스트마다 connect_factory를 바꾼다
+    pg.connect_factory = None
+
+    ext = types.ModuleType("psycopg2.extensions")
+    ext.TRANSACTION_STATUS_IDLE = IDLE
+    ext.TRANSACTION_STATUS_ACTIVE = ACTIVE
+    ext.TRANSACTION_STATUS_INTRANS = INTRANS
+    ext.TRANSACTION_STATUS_INERROR = INERROR
+    ext.TRANSACTION_STATUS_UNKNOWN = UNKNOWN
+
+    pool = types.ModuleType("psycopg2.pool")
+
+    class PoolError(pg.Error):
+        pass
+
+    class AbstractConnectionPool:
+        def __init__(self, minconn, maxconn, *args, **kwargs):
+            self.minconn = int(minconn)
+            self.maxconn = int(maxconn)
+            self.closed = False
+            self._args = args
+            self._kwargs = kwargs
+            self._pool = []
+            self._used = {}
+            self._rused = {}
+            self._keys = 0
+            for _ in range(self.minconn):
+                self._connect()
+
+        def _connect(self, key=None):
+            conn = pg.connect(*self._args, **self._kwargs)
+            if key is not None:
+                self._used[key] = conn
+                self._rused[id(conn)] = key
+            else:
+                self._pool.append(conn)
+            return conn
+
+        def _getkey(self):
+            self._keys += 1
+            return self._keys
+
+        def _getconn(self, key=None):
+            if self.closed:
+                raise PoolError("connection pool is closed")
+            if key is None:
+                key = self._getkey()
+            if key in self._used:
+                return self._used[key]
+            if self._pool:
+                self._used[key] = conn = self._pool.pop()
+                self._rused[id(conn)] = key
+                return conn
+            if len(self._used) == self.maxconn:
+                raise PoolError("connection pool exhausted")
+            return self._connect(key)
+
+        def _putconn(self, conn, key=None, close=False):
+            if self.closed:
+                raise PoolError("connection pool is closed")
+            if key is None:
+                key = self._rused.get(id(conn))
+                if key is None:
+                    raise PoolError("trying to put unkeyed connection")
+            if len(self._pool) < self.minconn and not close:
+                if not conn.closed:
+                    status = conn.info.transaction_status
+                    if status == UNKNOWN:
+                        conn.close()
+                    elif status != IDLE:
+                        conn.rollback()
+                        self._pool.append(conn)
+                    else:
+                        self._pool.append(conn)
+            else:
+                conn.close()
+            if not self.closed or key in self._used:
+                del self._used[key]
+                del self._rused[id(conn)]
+
+        def _closeall(self):
+            if self.closed:
+                raise PoolError("connection pool is closed")
+            for conn in self._pool + list(self._used.values()):
+                conn.close()
+            self.closed = True
+
+    class ThreadedConnectionPool(AbstractConnectionPool):
+        def __init__(self, minconn, maxconn, *args, **kwargs):
+            AbstractConnectionPool.__init__(self, minconn, maxconn, *args, **kwargs)
+            self._lock = threading.Lock()
+
+        def getconn(self, key=None):
+            with self._lock:
+                return self._getconn(key)
+
+        def putconn(self, conn=None, key=None, close=False):
+            with self._lock:
+                self._putconn(conn, key, close)
+
+        def closeall(self):
+            with self._lock:
+                self._closeall()
+
+    pool.PoolError = PoolError
+    pool.AbstractConnectionPool = AbstractConnectionPool
+    pool.ThreadedConnectionPool = ThreadedConnectionPool
+    pg.pool, pg.extensions = pool, ext
     return pg
 
 
@@ -49,7 +158,10 @@ db = load_db_module()
 
 
 class FakeConn:
-    """psycopg2 연결 흉내: autocommit이 꺼져 있으면 첫 질의 앞에 BEGIN, 트랜잭션이 없으면 commit/rollback은 아무것도 안 보냄."""
+    """psycopg2 연결 흉내: autocommit이 꺼져 있으면 첫 질의 앞에 BEGIN, 트랜잭션이 없으면 commit/rollback은 아무것도 안 보냄.
+
+    "fail"로 시작하는 질의는 IntegrityError를 내고 트랜잭션을 오류 상태(INERROR)로 만든다.
+    """
 
     def __init__(self, name, log, dead=False, closed=0, results=()):
         self.name, self.log, self.dead, self.closed = name, log, dead, closed
@@ -57,6 +169,18 @@ class FakeConn:
         self.rowcount = 1
         self._autocommit = False
         self.in_transaction = False
+        self.failed = False
+        self.lost = False  # 서버 연결이 끊긴 것을 libpq가 알고 있음(closed는 아직 0)
+
+    @property
+    def info(self):
+        if self.closed or self.lost:
+            status = UNKNOWN
+        elif self.failed:
+            status = INERROR
+        else:
+            status = INTRANS if self.in_transaction else IDLE
+        return types.SimpleNamespace(transaction_status=status)
 
     @property
     def autocommit(self):
@@ -84,13 +208,17 @@ class FakeConn:
         if not self._autocommit and not self.in_transaction:
             self.in_transaction = True
             self.log.append((self.name, "BEGIN"))
-        self.log.append((self.name, " ".join(sql.split())[:40], params))
+        self.log.append((self.name, " ".join(sql.split()), params))
+        if sql.startswith("fail"):
+            self.failed = True
+            raise PG.IntegrityError("duplicate key value violates unique constraint")
 
     def _end(self, word):
         if self.closed:
             raise PG.InterfaceError("connection already closed")
         if self.in_transaction:
             self.in_transaction = False
+            self.failed = False
             self.log.append((self.name, word))
 
     def commit(self):
@@ -129,11 +257,15 @@ class FakeCursor:
 
 
 class FakePool:
-    def __init__(self, conns, exhausted=0, closed=False):
+    """connection()의 꺼내기·돌려주기 순서만 보는 단순한 풀. conns를 차례로 내준다."""
+
+    def __init__(self, conns, exhausted=0, closed=False, error=None):
         self.conns = list(conns)
         self.exhausted = exhausted  # 이만큼 PoolError("connection pool exhausted")를 낸다
         self.closed = closed
+        self.error = error  # 새 연결을 열다 실패한 경우
         self.put = []
+        self.idle_closed = 0
 
     def getconn(self):
         if self.closed:
@@ -141,12 +273,17 @@ class FakePool:
         if self.exhausted:
             self.exhausted -= 1
             raise PG.pool.PoolError("connection pool exhausted")
+        if self.error is not None:
+            raise self.error
         return self.conns.pop(0)
 
     def putconn(self, conn, key=None, close=False):
         self.put.append((conn.name, close))
         if close:
             conn.close()
+
+    def close_idle(self):
+        self.idle_closed += 1
 
 
 class FakeClock:
@@ -163,7 +300,16 @@ class FakeClock:
 
 
 PING = "select 1"
-LOCK = "select pg_advisory_xact_lock(%s)"
+LOCK = "set local lock_timeout = %s; select pg_advisory_xact_lock(%s)"
+POOL_ARGS = dict(
+    dsn="postgresql://example",
+    connect_timeout=10,
+    keepalives=1,
+    keepalives_idle=30,
+    keepalives_interval=10,
+    keepalives_count=3,
+    application_name="team-formation",
+)
 
 
 class DbLogicTestCase(unittest.TestCase):
@@ -173,35 +319,135 @@ class DbLogicTestCase(unittest.TestCase):
         patcher = mock.patch.object(db, "time", self.clock)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.opened = []  # 가짜 connect가 연 연결(순서대로)
+        patcher = mock.patch.object(PG, "connect_factory", self.fake_connect)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def conn(self, name, **kwargs):
         return FakeConn(name, self.log, **kwargs)
 
+    def fake_connect(self, *args, **kwargs):
+        self.connect_args = (args, kwargs)
+        conn = self.conn(f"C{len(self.opened) + 1}")
+        self.opened.append(conn)
+        return conn
 
-class ConnectionTests(DbLogicTestCase):
-    def test_make_pool_arguments(self):
-        PG.pool.ThreadedConnectionPool.reset_mock()
-        db.make_pool("postgresql://example")
-        PG.pool.ThreadedConnectionPool.assert_called_once_with(
-            minconn=1,
-            maxconn=8,
-            dsn="postgresql://example",
-            connect_timeout=10,
-            keepalives=1,
-            keepalives_idle=30,
-            keepalives_interval=10,
-            keepalives_count=3,
-            application_name="team-formation",
-        )
+    def sqls(self):
+        return [entry[1] for entry in self.log]
+
+
+class PoolTests(DbLogicTestCase):
+    def test_make_pool_opens_one_connection(self):
+        pool = db.make_pool("postgresql://example")
+        self.assertIsInstance(pool, db.ReusingConnectionPool)
+        self.assertEqual((pool.minconn, pool.maxconn), (1, 5))
+        self.assertEqual(len(self.opened), 1)  # 시작할 때 미리 여는 것은 1개뿐
+        self.assertEqual(self.connect_args, ((), POOL_ARGS))
+
+    def test_returned_connections_are_reused(self):
+        pool = db.make_pool("postgresql://example")
+        # 화면 세 개가 겹쳐 연결 세 개를 쓴 뒤 돌려준다
+        with db.connection(pool) as a, db.connection(pool) as b, db.connection(pool) as c:
+            first = {a, b, c}
+        self.assertEqual(len(self.opened), 3)
+        self.assertFalse(any(conn.closed for conn in first))  # minconn(1)개를 넘어도 닫지 않고 쉬게 둔다
+        self.assertEqual(len(pool._pool), 3)
+        # 다시 세 개가 겹쳐도 새로 접속하지 않고 쉬던 연결을 쓴다
+        with db.connection(pool) as a, db.connection(pool) as b, db.connection(pool) as c:
+            self.assertEqual({a, b, c}, first)
+        with db.connection(pool) as again:
+            self.assertIn(again, first)
+        self.assertEqual(len(self.opened), 3)
+
+    def test_closed_broken_or_close_true_connections_are_not_kept(self):
+        pool = db.make_pool("postgresql://example")
+        conns = [pool.getconn() for _ in range(5)]
+        a, b, c, d, e = conns
+        pool.putconn(a, close=True)
+        b.close()
+        pool.putconn(b)
+        c.lost = True  # 서버 연결이 끊김(TRANSACTION_STATUS_UNKNOWN)
+        pool.putconn(c)
+        d.cursor().execute("update x", None)  # 트랜잭션 중
+        pool.putconn(d)
+        pool.putconn(e)
+        self.assertEqual([conn.closed for conn in conns], [1, 1, 1, 0, 0])
+        self.assertEqual(pool._pool, [d, e])
+        self.assertEqual(self.log[-1], ("C4", "ROLLBACK"))  # 트랜잭션을 되돌리고 쉬게 둔다
+        self.assertEqual((pool._used, pool._rused), ({}, {}))
+        with self.assertRaises(PG.pool.PoolError):
+            pool.putconn(self.conn("X"))  # 이 풀의 연결이 아님
+
+    def test_dead_idle_connections_are_all_replaced(self):
+        pool = db.make_pool("postgresql://example")
+        with db.connection(pool) as a, db.connection(pool) as b:
+            pass
+        a.dead = b.dead = True  # 쉬는 동안 둘 다 서버 쪽에서 끊김
+        with db.connection(pool) as conn:
+            self.assertNotIn(conn, (a, b))
+        self.assertTrue(a.closed and b.closed)
+        self.assertEqual(len(self.opened), 3)
+        self.assertEqual(pool._pool, [conn])
+
+    def test_close_idle_and_closeall(self):
+        pool = db.make_pool("postgresql://example")
+        with db.connection(pool) as a, db.connection(pool) as b:
+            pass
+        pool.close_idle()
+        self.assertEqual(pool._pool, [])
+        self.assertTrue(a.closed and b.closed)
+        pool.closeall()
+        self.assertTrue(pool.closed)
+
+
+class ConnectFailureTests(DbLogicTestCase):
+    CASES = {
+        'could not translate host name "ss@aws-0.pooler.supabase.com" to address: Name or service not known':
+            "주소/포트 오류",
+        'invalid integer value "ss@5432" for connection option "port"': "주소/포트 오류",
+        'connection to server at "h" (1.2.3.4), port 5432 failed: timeout expired': "시간 초과",
+        'connection to server at "h", port 5432 failed: FATAL:  password authentication failed for user "pw-ss"':
+            "인증 실패",
+        "connection to server at \"h\", port 5432 failed: FATAL:  Tenant or user not found": "인증 실패",
+        'connection to server at "h", port 5432 failed: Connection refused': "연결 실패",
+    }
+
+    def assert_generic(self, caught, reason):
+        error = caught.exception
+        self.assertIsInstance(error, PG.OperationalError)
+        self.assertEqual(str(error), f"DB에 연결하지 못했습니다 ({reason})")
+        self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)  # 원래 오류(문구)가 따라가지 않는다
+        self.assertTrue(error.__suppress_context__)
+
+    def test_make_pool_failures_become_generic_messages(self):
+        for text, reason in self.CASES.items():
+            with self.subTest(reason=reason, text=text[:30]):
+                with mock.patch.object(PG, "connect_factory", side_effect=PG.OperationalError(text)):
+                    with self.assertRaises(PG.OperationalError) as caught:
+                        db.make_pool("postgresql://u:pw-ss@aws-0.pooler.supabase.com:5432/postgres")
+                self.assert_generic(caught, reason)
+                self.assertNotIn("ss", str(caught.exception))
+
+    def test_new_connection_failure_in_connection_is_generic(self):
+        text = 'could not translate host name "ss@h" to address'
+        pool = FakePool([], error=PG.OperationalError(text))
+        with self.assertRaises(PG.OperationalError) as caught:
+            with db.connection(pool):
+                self.fail("연결을 빌려 주면 안 됨")
+        self.assert_generic(caught, "주소/포트 오류")
 
     def test_malformed_url_error_does_not_show_the_url(self):
         secret_error = PG.ProgrammingError('invalid dsn: unexpected character in URI: "postgresql://u:pw-secret@h"')
-        with mock.patch.object(PG.pool, "ThreadedConnectionPool", side_effect=secret_error):
+        with mock.patch.object(PG, "connect_factory", side_effect=secret_error):
             with self.assertRaises(ValueError) as caught:
                 db.make_pool("postgresql://u:pw-secret@h")
-        self.assertNotIn("pw-secret", str(caught.exception))
-        self.assertTrue(caught.exception.__suppress_context__)  # 원래 오류는 traceback에 나오지 않는다
+        self.assertEqual(str(caught.exception), "DATABASE_URL 형식이 맞지 않습니다")
+        self.assertIsNone(caught.exception.__context__)
 
+
+class ConnectionTests(DbLogicTestCase):
     def test_ping_without_transaction_then_return_to_pool(self):
         a = self.conn("A")
         pool = FakePool([a])
@@ -240,6 +486,7 @@ class ConnectionTests(DbLogicTestCase):
                 with db.connection(pool) as conn:
                     self.assertIs(conn, b)
                 self.assertEqual(pool.put, [("A", True), ("B", False)])
+                self.assertEqual(pool.idle_closed, 1)  # 같이 쉬던 연결도 닫고 새로 받는다
                 self.assertTrue(a.closed)
 
     def test_gives_up_after_one_new_connection(self):
@@ -277,15 +524,16 @@ class ConnectionTests(DbLogicTestCase):
 
 
 class TransactionTests(DbLogicTestCase):
-    def test_write_repo_locks_first_and_commits(self):
+    def test_write_repo_locks_first_with_timeout_and_commits(self):
         pool = FakePool([self.conn("A")])
         with db.write_repo(pool) as repo:
             repo.set_closed()
-        self.assertEqual(
-            [entry[1] for entry in self.log], [PING, "BEGIN", LOCK, "insert into tf_settings (key, value) val", "COMMIT"]
-        )
-        self.assertEqual(self.log[2], ("A", LOCK, (db.LOCK_KEY,)))
-        self.assertEqual(db.LOCK_KEY, 7240001)
+        sqls = self.sqls()
+        self.assertEqual(sqls[:3], [PING, "BEGIN", LOCK])
+        self.assertTrue(sqls[3].startswith("insert into tf_settings"))
+        self.assertEqual(sqls[4:], ["COMMIT"])
+        self.assertEqual(self.log[2], ("A", LOCK, ("15s", 7240001)))  # 잠금 시간 제한과 잠금을 한 번에
+        self.assertEqual((db.LOCK_KEY, db.LOCK_TIMEOUT), (7240001, "15s"))
         self.assertEqual(pool.put, [("A", False)])
 
     def test_write_repo_rolls_back_and_reraises(self):
@@ -294,25 +542,34 @@ class TransactionTests(DbLogicTestCase):
             with db.write_repo(pool) as repo:
                 repo.set_closed()
                 raise RuntimeError("일부러")
-        self.assertEqual([entry[1] for entry in self.log][-1], "ROLLBACK")
-        self.assertNotIn("COMMIT", [entry[1] for entry in self.log])
+        self.assertEqual(self.sqls()[-1], "ROLLBACK")
+        self.assertNotIn("COMMIT", self.sqls())
+        self.assertEqual(pool.put, [("A", False)])
+
+    def test_swallowed_db_error_is_not_committed(self):
+        pool = FakePool([self.conn("A")])
+        with self.assertRaises(PG.InternalError):
+            with db.write_repo(pool) as repo:
+                repo.set_closed()
+                try:
+                    repo._cur.execute("fail: 유일성 제약 위반", None)
+                except PG.IntegrityError:
+                    pass  # 잡고 넘어가도 트랜잭션은 오류 상태
+        self.assertEqual(self.sqls()[-1], "ROLLBACK")
+        self.assertNotIn("COMMIT", self.sqls())
         self.assertEqual(pool.put, [("A", False)])
 
     def test_read_repo_is_read_only_and_rolls_back(self):
         pool = FakePool([self.conn("A", results=[(STATE_JSON,)])])
         with db.read_repo(pool) as repo:
             repo.load_state()
-        self.assertEqual(
-            [entry[1] for entry in self.log][:3] + [self.log[-1][1]],
-            [PING, "BEGIN", "set transaction read only", "ROLLBACK"],
-        )
+        sqls = self.sqls()
+        self.assertEqual(sqls[:3] + sqls[-1:], [PING, "BEGIN", "set transaction read only", "ROLLBACK"])
 
     def test_ensure_schema_runs_sql_under_lock(self):
         pool = FakePool([self.conn("A")])
         db.ensure_schema(pool, "create table if not exists tf_x (id int)")
-        self.assertEqual(
-            [entry[1] for entry in self.log], [PING, "BEGIN", LOCK, "create table if not exists tf_x (id int)", "COMMIT"]
-        )
+        self.assertEqual(self.sqls(), [PING, "BEGIN", LOCK, "create table if not exists tf_x (id int)", "COMMIT"])
         self.assertIsNone(self.log[3][2])  # 매개변수 없이 실행(% 글자를 바꾸지 않음)
 
     def test_schema_file_is_read_as_utf8(self):

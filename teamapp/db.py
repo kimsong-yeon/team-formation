@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import psycopg2
 import psycopg2.extensions
@@ -28,13 +28,39 @@ from teamapp.roster import ADMIN_NO, RosterRow
 from teamapp.rules import PENDING, ROLES, TEAM_MAX, Application, State, Student
 
 LOCK_KEY = 7240001  # 쓰기를 한 번에 하나씩 처리하는 잠금 번호(pg_advisory_xact_lock)
-POOL_MIN = 1
-POOL_MAX = 8
+LOCK_TIMEOUT = "15s"  # 잠금을 이보다 오래 기다리면 그 쓰기는 오류로 끝난다(멈춘 쓰기가 모두를 막지 않도록)
+POOL_MIN = 1  # 시작할 때 미리 여는 연결 수
+POOL_MAX = 5  # Supabase 무료 플랜 Session pooler의 서버 연결(약 15개)을 PC 테스트, GitHub Actions와 나눠 씀
 POOL_WAIT_SECONDS = 5.0  # 풀의 연결이 모두 쓰이는 중이면 이만큼 기다린다
 POOL_RETRY_SLEEP = 0.05
 ADMIN_NAME = "관리자"
 CLOSED_KEY = "closed"  # tf_settings에 (closed, true)가 있으면 모집 마감
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schema.sql"
+
+T = TypeVar("T")
+
+# 연결 실패 원문에는 DATABASE_URL 조각(비밀번호가 섞일 수 있음)이 들어갈 수 있어, 종류만 골라 일반 문구로 바꾼다.
+# 앞에서부터 처음 맞는 것을 쓴다. 맞는 것이 없으면 "연결 실패".
+_CONNECT_FAILURES = (
+    (
+        "주소/포트 오류",
+        (
+            "could not translate host name",
+            "name or service not known",
+            "nodename nor servname",
+            "no such host",
+            "unknown host",
+            "could not parse network address",
+            "invalid port",
+            "invalid integer value",
+        ),
+    ),
+    ("시간 초과", ("timeout expired", "timed out")),
+    (
+        "인증 실패",
+        ("authentication failed", "no password supplied", "tenant or user not found", "sasl", "password"),
+    ),
+)
 
 
 def read_schema_sql() -> str:
@@ -45,13 +71,75 @@ def read_schema_sql() -> str:
 # ---- 연결 풀과 연결 ----
 
 
-def make_pool(dsn: str) -> psycopg2.pool.ThreadedConnectionPool:
-    """연결 풀을 만든다. 최소 1개 연결을 바로 만들므로 접속 정보가 틀리면 여기서 오류가 난다.
+class ReusingConnectionPool(psycopg2.pool.ThreadedConnectionPool):
+    """돌려받은 연결을 maxconn개까지 쉬게 두었다가 다시 쓰는 연결 풀.
 
-    DATABASE_URL 형식이 틀리면 psycopg2 오류 문구에 주소(비밀번호 포함)가 섞일 수 있어, 값 없는 문구로 바꾼다.
+    psycopg2의 기본 풀은 쉬는 연결이 minconn개가 되면 그 뒤로 돌려받는 연결을 닫는다. 그러면 화면 여러 개가 겹칠 때
+    거의 매번 새로 접속(TCP, TLS, 인증)하게 된다. 시작할 때 미리 여는 연결은 minconn개 그대로이다.
+    close=True로 돌려받거나, 이미 닫혔거나, 서버 연결이 끊긴 연결은 닫아서 버린다.
+    """
+
+    def _putconn(self, conn, key=None, close=False):
+        # ThreadedConnectionPool.putconn이 잠금을 잡은 채로 부른다.
+        if self.closed:
+            raise psycopg2.pool.PoolError("connection pool is closed")
+        if key is None:
+            key = self._rused.get(id(conn))
+            if key is None:
+                raise psycopg2.pool.PoolError("trying to put unkeyed connection")
+        keep = not close and not conn.closed and len(self._pool) < self.maxconn
+        if keep:
+            status = conn.info.transaction_status
+            if status == psycopg2.extensions.TRANSACTION_STATUS_UNKNOWN:  # 서버 연결이 끊김
+                keep = False
+            elif status != psycopg2.extensions.TRANSACTION_STATUS_IDLE:  # 트랜잭션 중이거나 오류 상태
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    keep = False
+        if keep:
+            self._pool.append(conn)
+        else:
+            conn.close()
+        del self._used[key]
+        del self._rused[id(conn)]
+
+    def close_idle(self) -> None:
+        """쉬고 있는 연결을 모두 닫는다(하나가 끊겨 있으면 같이 쉬던 연결도 끊겼을 수 있음)."""
+        with self._lock:
+            idle, self._pool = self._pool, []
+        for conn in idle:
+            conn.close()
+
+
+def _connect_failure(error: Exception) -> str:
+    text = str(error).lower()
+    for reason, needles in _CONNECT_FAILURES:
+        if any(needle in text for needle in needles):
+            return reason
+    return "연결 실패"
+
+
+def _opening(open_connection: Callable[[], T]) -> T:
+    """새 연결을 여는 일(풀 만들기, 풀에서 꺼내기)을 하고, 실패하면 원문 없이 종류만 담은 오류로 바꾼다.
+
+    새 오류는 except 블록 밖에서 내므로 원래 오류(문구)가 __context__로도 따라가지 않는다.
     """
     try:
-        return psycopg2.pool.ThreadedConnectionPool(
+        return open_connection()
+    except psycopg2.ProgrammingError:  # invalid dsn: libpq가 주소 전체를 문구에 넣기도 한다
+        reason = None
+    except psycopg2.OperationalError as error:
+        reason = _connect_failure(error)
+    if reason is None:
+        raise ValueError("DATABASE_URL 형식이 맞지 않습니다") from None
+    raise psycopg2.OperationalError(f"DB에 연결하지 못했습니다 ({reason})") from None
+
+
+def make_pool(dsn: str) -> ReusingConnectionPool:
+    """연결 풀을 만든다. 연결 1개를 바로 열므로 접속 정보가 틀리면 여기서 (원문 없는) 오류가 난다."""
+    return _opening(
+        lambda: ReusingConnectionPool(
             minconn=POOL_MIN,
             maxconn=POOL_MAX,
             dsn=dsn,
@@ -62,16 +150,15 @@ def make_pool(dsn: str) -> psycopg2.pool.ThreadedConnectionPool:
             keepalives_count=3,
             application_name="team-formation",
         )
-    except psycopg2.ProgrammingError:  # invalid dsn
-        raise ValueError("DATABASE_URL 형식이 맞지 않습니다") from None
+    )
 
 
-def _getconn(pool: psycopg2.pool.AbstractConnectionPool) -> psycopg2.extensions.connection:
+def _getconn(pool: ReusingConnectionPool) -> psycopg2.extensions.connection:
     """풀에서 연결을 꺼낸다. 모두 쓰이는 중이면(PoolError) 잠깐씩 쉬며 POOL_WAIT_SECONDS까지 다시 해 본다."""
     deadline = time.monotonic() + POOL_WAIT_SECONDS
     while True:
         try:
-            return pool.getconn()
+            return _opening(pool.getconn)
         except psycopg2.pool.PoolError:
             if pool.closed or time.monotonic() >= deadline:
                 raise
@@ -99,7 +186,7 @@ def _is_alive(conn: psycopg2.extensions.connection) -> bool:
     return True
 
 
-def _discard(pool: psycopg2.pool.AbstractConnectionPool, conn: psycopg2.extensions.connection) -> None:
+def _discard(pool: ReusingConnectionPool, conn: psycopg2.extensions.connection) -> None:
     """연결을 닫고 풀에서 뺀다."""
     try:
         pool.putconn(conn, close=True)
@@ -107,8 +194,8 @@ def _discard(pool: psycopg2.pool.AbstractConnectionPool, conn: psycopg2.extensio
         conn.close()
 
 
-def _checkin(pool: psycopg2.pool.AbstractConnectionPool, conn: psycopg2.extensions.connection) -> None:
-    """끝나지 않은 트랜잭션을 되돌리고 연결을 풀에 돌려준다. 끊긴 연결은 닫아서 뺀다."""
+def _checkin(pool: ReusingConnectionPool, conn: psycopg2.extensions.connection) -> None:
+    """끝나지 않은 트랜잭션을 되돌리고 연결을 풀에 돌려준다(풀이 쉬게 두었다가 다시 씀). 끊긴 연결은 닫아서 뺀다."""
     broken = bool(conn.closed)
     if not broken:
         try:
@@ -124,9 +211,12 @@ def _checkin(pool: psycopg2.pool.AbstractConnectionPool, conn: psycopg2.extensio
         conn.close()
 
 
-def _checkout(pool: psycopg2.pool.AbstractConnectionPool) -> psycopg2.extensions.connection:
-    """살아 있는 연결을 꺼낸다. 끊긴 연결은 버리고 새 연결을 한 번만 더 받는다."""
-    for _ in range(2):
+def _checkout(pool: ReusingConnectionPool) -> psycopg2.extensions.connection:
+    """살아 있는 연결을 꺼낸다.
+
+    꺼낸 연결이 끊겼으면 버리고, 같이 쉬던 연결도 모두 닫은 뒤(함께 끊겼을 수 있음) 새 연결을 한 번만 더 받는다.
+    """
+    for attempt in range(2):
         conn = _getconn(pool)
         try:
             alive = _is_alive(conn)
@@ -136,11 +226,13 @@ def _checkout(pool: psycopg2.pool.AbstractConnectionPool) -> psycopg2.extensions
         if alive:
             return conn
         _discard(pool, conn)
+        if attempt == 0:
+            pool.close_idle()
     raise psycopg2.OperationalError("DB에 다시 연결했지만 응답이 없습니다")
 
 
 @contextmanager
-def connection(pool: psycopg2.pool.AbstractConnectionPool) -> Iterator[psycopg2.extensions.connection]:
+def connection(pool: ReusingConnectionPool) -> Iterator[psycopg2.extensions.connection]:
     """살아 있는 연결을 빌려 주고, 다 쓰면(오류가 나도) 되돌리고 풀에 돌려준다."""
     conn = _checkout(pool)
     try:
@@ -157,14 +249,23 @@ def _rollback_quietly(conn: psycopg2.extensions.connection) -> None:
 
 
 @contextmanager
-def _locked_cursor(pool: psycopg2.pool.AbstractConnectionPool) -> Iterator[psycopg2.extensions.cursor]:
-    """쓰기 트랜잭션 하나. 잠금부터 걸고, 끝까지 성공하면 commit, 예외면 rollback하고 예외를 그대로 낸다."""
+def _locked_cursor(pool: ReusingConnectionPool) -> Iterator[psycopg2.extensions.cursor]:
+    """쓰기 트랜잭션 하나. 잠금부터 걸고, 끝까지 성공하면 commit, 예외면 rollback하고 예외를 그대로 낸다.
+
+    블록 안에서 DB 오류를 잡고 넘어가 트랜잭션이 오류 상태로 끝나면, commit(실제로는 조용한 rollback)하지 않고
+    rollback한 뒤 오류를 낸다. 성공처럼 보이면 안 되기 때문이다.
+    """
     with connection(pool) as conn:
         try:
             with conn.cursor() as cur:
-                # psycopg2는 첫 질의 앞에 BEGIN을 보낸다. 잠금은 commit/rollback 때 저절로 풀린다.
-                cur.execute("select pg_advisory_xact_lock(%s)", (LOCK_KEY,))
+                # psycopg2는 첫 질의 앞에 BEGIN을 보낸다. 잠금 시간 제한(이 트랜잭션에만)과 잠금을 한 번에 보낸다.
+                # 잠금은 commit/rollback 때 저절로 풀린다.
+                cur.execute(
+                    "set local lock_timeout = %s; select pg_advisory_xact_lock(%s)", (LOCK_TIMEOUT, LOCK_KEY)
+                )
                 yield cur
+            if conn.info.transaction_status == psycopg2.extensions.TRANSACTION_STATUS_INERROR:
+                raise psycopg2.InternalError("쓰기 도중 DB 오류가 있어 트랜잭션을 되돌렸습니다")
             conn.commit()
         except BaseException:
             _rollback_quietly(conn)
@@ -172,14 +273,14 @@ def _locked_cursor(pool: psycopg2.pool.AbstractConnectionPool) -> Iterator[psyco
 
 
 @contextmanager
-def write_repo(pool: psycopg2.pool.AbstractConnectionPool) -> Iterator[PgRepo]:
+def write_repo(pool: ReusingConnectionPool) -> Iterator[PgRepo]:
     """쓰기용 저장소. 블록 하나가 잠긴 트랜잭션 하나이다."""
     with _locked_cursor(pool) as cur:
         yield PgRepo(cur)
 
 
 @contextmanager
-def read_repo(pool: psycopg2.pool.AbstractConnectionPool) -> Iterator[PgRepo]:
+def read_repo(pool: ReusingConnectionPool) -> Iterator[PgRepo]:
     """읽기 전용 저장소. 쓰기 함수를 부르면 DB가 오류를 낸다. 끝나면 되돌린다."""
     with connection(pool) as conn:
         try:
@@ -193,13 +294,13 @@ def read_repo(pool: psycopg2.pool.AbstractConnectionPool) -> Iterator[PgRepo]:
 # ---- 테이블과 관리자 계정 ----
 
 
-def ensure_schema(pool: psycopg2.pool.AbstractConnectionPool, sql: str) -> None:
+def ensure_schema(pool: ReusingConnectionPool, sql: str) -> None:
     """schema.sql을 실행해 없는 테이블을 만든다. 앱 프로세스 여러 개가 동시에 시작해도 되도록 잠그고 한다."""
     with _locked_cursor(pool) as cur:
         cur.execute(sql)
 
 
-def ensure_admin(pool: psycopg2.pool.AbstractConnectionPool, admin_password: str) -> None:
+def ensure_admin(pool: ReusingConnectionPool, admin_password: str) -> None:
     """관리자 계정(학번 admin)이 없으면 만들고, 비밀번호 해시가 admin_password와 다르면 갱신한다."""
     if not admin_password:
         raise ValueError("ADMIN_PASSWORD가 비어 있어 관리자 계정을 만들 수 없습니다")

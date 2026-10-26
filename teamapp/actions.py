@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from teamapp.passwords import hash_password, verify_password
@@ -45,7 +45,7 @@ class Account:
     id: int
     student_no: str
     name: str
-    password_hash: str
+    password_hash: str = field(repr=False)  # 해시가 repr·테스트 실패 문구에 나오지 않게
     is_admin: bool
 
 
