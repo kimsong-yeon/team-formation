@@ -228,6 +228,10 @@ class KeepAliveScriptTest(unittest.TestCase):
 
     def test_running_script_without_url_exits_1_with_one_line(self):
         env = {key: value for key, value in os.environ.items() if key != "DATABASE_URL"}
+        # Windows(cp949 콘솔)에서도 한글을 UTF-8로 쓰고 읽도록 고정한다. -I는 PYTHON* 환경 변수를 무시하므로
+        # 실제로 효과가 있는 것은 -X utf8이고, 환경 변수는 -I를 빼더라도 같은 결과가 나오게 하는 이중 안전장치다.
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
         with tempfile.TemporaryDirectory() as other_dir:  # 저장소 밖에서도(실행기와 비슷하게) 돌아야 한다
             result = subprocess.run(
                 [sys.executable, "-I", "-X", "utf8", str(SCRIPT)],
@@ -236,9 +240,13 @@ class KeepAliveScriptTest(unittest.TestCase):
                 capture_output=True,
                 timeout=60,
             )
+        # Windows는 파이프로 나가는 줄바꿈을 \r\n으로 바꾸므로 \r\n만 \n으로 맞춘 뒤 정확히 비교한다
+        # (줄 수나 빈 줄이 더 있으면 여전히 실패한다).
+        stdout = result.stdout.decode("utf-8").replace("\r\n", "\n")
+        stderr = result.stderr.decode("utf-8").replace("\r\n", "\n")
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout.decode("utf-8"), "DB 요청 실패\n")
-        self.assertEqual(result.stderr.decode("utf-8"), "")
+        self.assertEqual(stdout, "DB 요청 실패\n")
+        self.assertEqual(stderr, "")
 
 
 class KeepAliveWorkflowTest(unittest.TestCase):
