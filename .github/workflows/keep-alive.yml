@@ -1,0 +1,26 @@
+# 매일 DB에 질의를 한 번 보내 Supabase 무료 프로젝트가 일시정지되지 않게 한다.
+# 실행 시각: 00:17 UTC = 한국 시간 09:17 (정각을 피해 지연을 줄임)
+# DB 주소는 저장소 Settings > Secrets and variables > Actions 에 등록한 비밀 값에서만 읽는다.
+name: keep-alive
+
+on:
+  schedule:
+    - cron: "17 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install psycopg2-binary
+      - run: python scripts/keep_alive.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
