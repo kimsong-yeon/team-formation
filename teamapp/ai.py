@@ -38,6 +38,7 @@ _REQUEST_TIMEOUT = (10, 130)
 _TICK_SECONDS = 1.0
 _ERROR_TEXT_LIMIT = 80
 
+_TIMEOUT = "시간 초과"
 _UNREADABLE = "JSON을 읽을 수 없음"
 _EMPTY = "빈 응답"
 _CONNECTION = "연결 오류"
@@ -212,7 +213,7 @@ def run_with_deadline(
         if remaining <= 0:
             if done.is_set():
                 break
-            raise ModelFailure(f"시간 초과({seconds:g}초)")
+            raise ModelFailure(f"{_TIMEOUT}({seconds:g}초)")
         if done.wait(min(_TICK_SECONDS, remaining)):
             break
         if on_tick is not None:
@@ -349,7 +350,10 @@ def run_assignment(
             )
         except ModelFailure as failure:
             following = f"{order + 1}차 모델로 넘어감" if order < len(models) else "앱이 직접 배정함"
-            log(f"{label}: {failure.reason} → {following}")
+            reason = failure.reason
+            if not reason.startswith(_TIMEOUT):  # 시간 초과 문구에는 이미 초가 들어 있다
+                reason = f"{reason} ({int(round(time.monotonic() - started))}초)"
+            log(f"{label}: {reason} → {following}")
             continue
         seconds = int(round(time.monotonic() - started))
         log(f"{label}: 검사 통과 ({seconds}초)")

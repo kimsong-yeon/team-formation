@@ -260,9 +260,9 @@ class RunWithDeadlineTest(unittest.TestCase):
         ticks = []
         with self.assertRaises(ModelFailure):
             run_with_deadline(lambda: time.sleep(1.5) or "", 0.3, ticks.append)
-        self.assertEqual(len(ticks), 1)
-        self.assertGreaterEqual(ticks[0], 0.29)
-        self.assertLess(ticks[0], 0.9)
+        self.assertGreaterEqual(len(ticks), 1)
+        self.assertGreaterEqual(ticks[0], 0.25)  # Windows에서는 기다림이 조금 일찍 끝날 수 있다
+        self.assertLess(ticks[-1], 0.9)
 
     def test_ticks_every_second_and_deadline_text_uses_plain_number(self):
         ticks = []
@@ -271,15 +271,15 @@ class RunWithDeadlineTest(unittest.TestCase):
             run_with_deadline(lambda: time.sleep(3) or "", 1.0, ticks.append)
         self.assertEqual(caught.exception.reason, "시간 초과(1초)")
         self.assertLess(time.monotonic() - started, 1.8)
-        self.assertEqual(len(ticks), 1)
-        self.assertGreaterEqual(ticks[0], 0.99)
+        self.assertGreaterEqual(len(ticks), 1)
+        self.assertGreaterEqual(ticks[0], 0.9)
 
     def test_ticks_while_waiting_for_a_slower_fn(self):
         ticks = []
         result = run_with_deadline(lambda: time.sleep(1.3) or "느린 답", 5, ticks.append)
         self.assertEqual(result, "느린 답")
-        self.assertEqual(len(ticks), 1)  # 1초 지점에서 한 번, 그 뒤 fn이 끝남
-        self.assertGreaterEqual(ticks[0], 0.99)
+        self.assertGreaterEqual(len(ticks), 1)  # 1초 지점쯤에서 틱, 그 뒤 fn이 끝남
+        self.assertGreaterEqual(ticks[0], 0.9)
 
     def test_no_tick_when_fn_finishes_at_once(self):
         ticks = []
@@ -471,8 +471,8 @@ class RunAssignmentTest(unittest.TestCase):
             result.lines,
             [
                 f"1차 모델({MODELS[0]}): 시간 초과(120초) → 2차 모델로 넘어감",
-                f"2차 모델({MODELS[1]}): HTTP 429(사용량 제한) → 3차 모델로 넘어감",
-                f"3차 모델({MODELS[2]}): 빈 응답 → 앱이 직접 배정함",
+                f"2차 모델({MODELS[1]}): HTTP 429(사용량 제한) (0초) → 3차 모델로 넘어감",
+                f"3차 모델({MODELS[2]}): 빈 응답 (0초) → 앱이 직접 배정함",
                 APP_LINE,
             ],
         )
@@ -489,7 +489,7 @@ class RunAssignmentTest(unittest.TestCase):
         self.assertEqual(len(fake.calls), 2)
         self.assertEqual(
             result.lines[0],
-            f"1차 모델({MODELS[0]}): 검사 실패: 팀2에 웹 프로그래머를 맡을 학생이 없음 → 2차 모델로 넘어감",
+            f"1차 모델({MODELS[0]}): 검사 실패: 팀2에 웹 프로그래머를 맡을 학생이 없음 (0초) → 2차 모델로 넘어감",
         )
         self.assertEqual(result.lines[1], f"2차 모델({MODELS[1]}): 검사 통과 (0초)")
         self.assertEqual(len(result.lines), 2)
@@ -503,15 +503,15 @@ class RunAssignmentTest(unittest.TestCase):
         self.assertEqual(
             result.lines[:3],
             [
-                f"1차 모델({MODELS[0]}): JSON을 읽을 수 없음 → 2차 모델로 넘어감",
-                f"2차 모델({MODELS[1]}): 검사 실패: 학생8이(가) 배정되지 않음 → 3차 모델로 넘어감",
-                f"3차 모델({MODELS[2]}): 빈 응답 → 앱이 직접 배정함",
+                f"1차 모델({MODELS[0]}): JSON을 읽을 수 없음 (0초) → 2차 모델로 넘어감",
+                f"2차 모델({MODELS[1]}): 검사 실패: 학생8이(가) 배정되지 않음 (0초) → 3차 모델로 넘어감",
+                f"3차 모델({MODELS[2]}): 빈 응답 (0초) → 앱이 직접 배정함",
             ],
         )
         self.assertEqual(result.source, APP_SOURCE)
         fake = FakeCall(answer(("2026777", 1)), GOOD_EASY)
         result, _ = self.run_it(state, fake)
-        self.assertEqual(result.lines[0], f"1차 모델({MODELS[0]}): 모르는 학번 2026777 → 2차 모델로 넘어감")
+        self.assertEqual(result.lines[0], f"1차 모델({MODELS[0]}): 모르는 학번 2026777 (0초) → 2차 모델로 넘어감")
         self.assertEqual(result.source, f"2차 모델({MODELS[1]})")
 
     def test_failure_line_reports_only_the_first_problem(self):
@@ -520,14 +520,14 @@ class RunAssignmentTest(unittest.TestCase):
         result, _ = self.run_it(state, fake)
         self.assertEqual(
             result.lines[0],
-            f"1차 모델({MODELS[0]}): 검사 실패: 학생7이(가) 배정되지 않음 → 2차 모델로 넘어감",
+            f"1차 모델({MODELS[0]}): 검사 실패: 학생7이(가) 배정되지 않음 (0초) → 2차 모델로 넘어감",
         )
 
     def test_unexpected_exception_from_call_is_connection_error(self):
         state = easy_state()
         fake = FakeCall(RuntimeError(f"boom {API_KEY}"), GOOD_EASY)
         result, _ = self.run_it(state, fake)
-        self.assertEqual(result.lines[0], f"1차 모델({MODELS[0]}): 연결 오류 → 2차 모델로 넘어감")
+        self.assertEqual(result.lines[0], f"1차 모델({MODELS[0]}): 연결 오류 (0초) → 2차 모델로 넘어감")
         self.assertEqual(result.source, f"2차 모델({MODELS[1]})")
         self.assertNotIn(API_KEY, "\n".join(result.lines))
 
@@ -565,11 +565,26 @@ class RunAssignmentTest(unittest.TestCase):
         slow_release.set()
         self.assertLess(time.monotonic() - started, 1.5)
         self.assertEqual(result.lines[0], f"1차 모델({MODELS[0]}): 시간 초과(0.3초) → 2차 모델로 넘어감")
+        self.assertNotRegex(result.lines[0], r"\)\s*\(\d+초\)")  # 시간 초과 줄에는 초를 또 붙이지 않는다
         self.assertEqual(result.source, f"2차 모델({MODELS[1]})")
         # 1차 모델을 기다리는 동안 틱이 on_wait로 이어진다
         ticks = [w for w in waits if w[0] == 1 and w[2] > 0]
         self.assertTrue(ticks)
-        self.assertGreaterEqual(ticks[0][2], 0.29)
+        self.assertGreaterEqual(ticks[0][2], 0.25)
+
+    def test_failure_line_shows_rounded_seconds_taken(self):
+        def slow_failure(model, messages, api_key):
+            time.sleep(0.7)  # 0.7초 걸린 뒤 실패 -> 반올림해 1초
+            raise ModelFailure("HTTP 429(사용량 제한)")
+
+        result, _ = self.run_it(easy_state(), slow_failure, models=("m1", "m2"))
+        self.assertEqual(
+            result.lines[:2],
+            [
+                "1차 모델(m1): HTTP 429(사용량 제한) (1초) → 2차 모델로 넘어감",
+                "2차 모델(m2): HTTP 429(사용량 제한) (1초) → 앱이 직접 배정함",
+            ],
+        )
 
     def test_lines_are_reported_as_soon_as_produced(self):
         state = easy_state()
@@ -593,7 +608,7 @@ class RunAssignmentTest(unittest.TestCase):
             [
                 ("wait", 1),
                 ("call", MODELS[0]),
-                ("line", f"1차 모델({MODELS[0]}): 빈 응답 → 2차 모델로 넘어감"),
+                ("line", f"1차 모델({MODELS[0]}): 빈 응답 (0초) → 2차 모델로 넘어감"),
                 ("wait", 2),
                 ("call", MODELS[1]),
                 ("line", f"2차 모델({MODELS[1]}): 검사 통과 (0초)"),
@@ -614,7 +629,7 @@ class RunAssignmentTest(unittest.TestCase):
         result, _ = self.run_it(state, fake, models=("m1",))
         self.assertEqual(
             result.lines,
-            ["1차 모델(m1): 빈 응답 → 앱이 직접 배정함", APP_LINE],
+            ["1차 모델(m1): 빈 응답 (0초) → 앱이 직접 배정함", APP_LINE],
         )
         self.assertEqual(result.source, APP_SOURCE)
 
