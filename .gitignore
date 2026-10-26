@@ -14,3 +14,6 @@ venv/
 
 # 작업 도구 기록
 .superpowers/
+
+# 연습 시나리오 자동 실행 기록(화면은 README에 쓸 것만 img/로 옮김)
+practice_runs/
