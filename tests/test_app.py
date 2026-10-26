@@ -137,6 +137,19 @@ def restore_admin_hash(pool, password_hash):
         conn.commit()
 
 
+def uploaded_csv(name, data):
+    """브라우저가 file_uploader로 올린 것과 같은 UploadedFile을 만든다.
+
+    가정: AppTest(1.66)에는 file_uploader에 파일을 넣는 API가 없다. 그래서 테스트는 이 객체를 at.session_state의
+    admin_roster_file에 넣는다. 다음 실행이 시작될 때 세션 값이 위젯 값으로 옮겨져 admin_start 콜백이 읽고, 화면의
+    file_uploader도 이 값을 그대로 쓴다(file_uploader는 file_id, name, size, _file_urls를 읽으므로 진짜 UploadedFile).
+    """
+    from streamlit.proto.Common_pb2 import FileURLs
+    from streamlit.runtime.uploaded_file_manager import UploadedFile, UploadedFileRec
+
+    return UploadedFile(UploadedFileRec("test-roster-file", name, "text/csv", data), FileURLs())
+
+
 def release_app_pool():
     """AppTest로 돌린 앱이 st.cache_resource에 만든 연결 풀을 놓아 준다(연결은 쓰레기 수거 때 닫힌다)."""
     try:
@@ -204,6 +217,16 @@ class TextHelperTests(unittest.TestCase):
         self.assertEqual(
             self.app.assign_result_text(result(None, "", [], ["팀3에 웹 프로그래머를 맡을 학생이 없음"])),
             "막힘: 규칙을 지키는 배정이 없음",
+        )
+
+    def test_problem_lines(self):
+        self.assertEqual(self.app.problem_lines(["배정할 학생이 없습니다"]), ["배정할 학생이 없습니다"])
+        self.assertEqual(
+            self.app.problem_lines(["팀3에 웹 프로그래머를 맡을 학생이 없음", "남은 자리보다 팀이 없는 학생이 많음"]),
+            [
+                "규칙을 지키는 배정이 없음: 팀3에 웹 프로그래머를 맡을 학생이 없음",
+                "규칙을 지키는 배정이 없음: 남은 자리보다 팀이 없는 학생이 많음",
+            ],
         )
 
     def test_plan_rows(self):
@@ -314,6 +337,11 @@ class ScreenTests(unittest.TestCase):
         present = [key for key in keys if find_key(at, key) is not None]
         self.assertEqual(present, [], "화면에 있으면 안 되는 key")
 
+    def assert_result(self, at, first_word):
+        text = self.text_of_key(at, "result")
+        self.assertTrue(text.startswith(first_word + ": "), text)
+        return text
+
     # ---- 테스트 ----
     def test_login_page_keys(self):
         at = self.open_app()
@@ -333,6 +361,25 @@ class ScreenTests(unittest.TestCase):
         self.assertEqual(self.text_of_key(at, "whoami"), "로그인: 관리자 (admin)")
         self.assertEqual(self.text_of_key(at, "unassigned").split(":")[0], "팀이 없는 학생 8명")
         self.assert_no_keys(at, ["apply_1", "login_student_no", "admin_confirm", "refresh"])
+
+    def test_admin_start_and_close(self):
+        """채점 프로그램이 처음 하는 관리자 단계: 명단 CSV 올리기, 팀 수 3, 처음 상태 만들기, 모집 마감."""
+        reset_roster(self.pool, "중간.csv", 4)  # 다른 명단에서 시작해 admin_start가 실제로 바꾸는지 본다
+        at = self.log_in(ADMIN_NO, self.admin_password)
+        at.session_state["admin_roster_file"] = uploaded_csv("쉬움.csv", (DATA_DIR / "쉬움.csv").read_bytes())
+        at.number_input(key="admin_team_count").set_value(3)
+        self.click(at, "admin_start")
+        self.assertIn("학생 8명과 빈 팀 3개", self.assert_result(at, "승인"))
+        self.assert_keys(at, ["team_1", "team_2", "team_3"])
+        self.assert_no_keys(at, ["team_4"])
+        self.assertEqual(self.text_of_key(at, "unassigned").split(":")[0], "팀이 없는 학생 8명")
+
+        self.click(at, "admin_close")
+        self.assert_result(at, "승인")
+        unassigned = self.text_of_key(at, "unassigned")
+        self.assertTrue(unassigned.startswith("팀이 없는 학생 8명: "), unassigned)
+        for name in ("학생1(PL;RW)", "학생4(WP;FD)", "학생8(TT;RW;PT)"):
+            self.assertIn(name, unassigned)
 
     def test_student_keys_and_no_admin(self):
         at = self.log_in("2026101", STUDENT_PASSWORD)

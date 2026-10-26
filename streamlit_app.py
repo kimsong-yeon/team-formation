@@ -320,23 +320,25 @@ def show_whoami(text: str) -> None:
         st.markdown(text)
 
 
-def result_placeholder():
-    """결과 안내 자리(key result). 안에 요소 하나만 두려고 st.empty를 쓴다. 채우는 것은 fill_result."""
-    return st.container(key="result").empty()
+def result_box():
+    """결과 안내 자리(key result). 여기서는 비워 두지 않는다: 실행이 끝날 때 fill_result가 요소 하나를 그려 지난
+    결과를 바꿀 때까지 화면에는 지난 결과가 그대로 보인다(3초마다 다시 그릴 때, AI 배정을 기다릴 때도)."""
+    return st.container(key="result")
 
 
-def fill_result(slot) -> None:
-    """세션의 마지막 결과 문구를 색 상자로(승인 초록, 대기 파랑, 거절 노랑, 막힘 빨강)."""
+def fill_result(box) -> None:
+    """세션의 마지막 결과 문구를 색 상자 하나로(승인 초록, 대기 파랑, 거절 노랑, 막힘 빨강). 실행마다 한 번만 부른다."""
     text = st.session_state.get(RESULT)
-    if not text:
-        slot.caption(NO_RESULT_YET)
-        return
-    kind, message = split_result(text)
-    if kind is None:
-        slot.error(md(text))
-        return
-    show = {APPROVED: slot.success, PENDING: slot.info, REJECTED: slot.warning, BLOCKED: slot.error}[kind]
-    show(f"{kind}: {md(message)}")
+    with box:
+        if not text:
+            st.caption(NO_RESULT_YET)
+            return
+        kind, message = split_result(text)
+        if kind is None:  # 생기지 않는 경우지만, 결과 안내는 늘 네 단어 가운데 하나로 시작하게 한다
+            st.error(f"{BLOCKED}: {md(text)}")
+            return
+        show = {APPROVED: st.success, PENDING: st.info, REJECTED: st.warning, BLOCKED: st.error}[kind]
+        show(f"{kind}: {md(message)}")
 
 
 def team_cards(
@@ -377,10 +379,10 @@ def login_page(pool: db.ReusingConnectionPool) -> None:
         student_no = st.text_input("학번", key="login_student_no")
         password = st.text_input("비밀번호", type="password", key="login_password")
         submitted = st.form_submit_button("로그인", key="login_submit")
-    slot = result_placeholder()
+    box = result_box()
     if submitted:
         log_in(pool, student_no, password)
-    fill_result(slot)
+    fill_result(box)
 
 
 def log_in(pool: db.ReusingConnectionPool, student_no: str, password: str) -> None:
@@ -411,12 +413,12 @@ def student_page(pool: db.ReusingConnectionPool, account: actions.Account) -> No
 @st.fragment(run_every=REFRESH_SECONDS)
 def student_body(pool: db.ReusingConnectionPool) -> None:
     """학생 화면 전체. 3초마다(그리고 이 안의 단추를 누를 때마다) 이 부분만 다시 그린다."""
-    slot = result_placeholder()
+    box = result_box()
     try:
         account, state = load_view(pool)
     except Exception:
         st.error(DB_FAILED)
-        fill_result(slot)
+        fill_result(box)
         return
     if account is None:
         restart_logged_out()
@@ -437,7 +439,7 @@ def student_body(pool: db.ReusingConnectionPool) -> None:
     if my_team is not None:
         st.markdown(highlight_css(my_team), unsafe_allow_html=True)
     team_cards(state, my_team=my_team, apply_pool=pool, lock_reason=lock_reason)
-    fill_result(slot)
+    fill_result(box)
 
 
 def incoming_applications(pool: db.ReusingConnectionPool, state: State, my_id: int, team_id: int) -> None:
@@ -476,10 +478,10 @@ def incoming_applications(pool: db.ReusingConnectionPool, state: State, my_id: i
 
 def admin_page(pool: db.ReusingConnectionPool, state: State) -> None:
     show_whoami("로그인: 관리자 (admin)")
-    slot = result_placeholder()
+    box = result_box()
     roster_section(pool)
-    assign_section(pool, state, slot)
-    fill_result(slot)
+    assign_section(pool, state)
+    fill_result(box)  # AI 배정을 눌렀으면 그 결과(배정이 끝난 뒤)
     admin_overview(pool)
 
 
@@ -501,13 +503,13 @@ def roster_section(pool: db.ReusingConnectionPool) -> None:
     st.button("명단으로 처음 상태 만들기", key="admin_start", on_click=on_start, args=(pool,))
 
 
-def assign_section(pool: db.ReusingConnectionPool, state: State, result_slot) -> None:
+def assign_section(pool: db.ReusingConnectionPool, state: State) -> None:
     st.subheader("마감과 배정")
     st.markdown(f"모집 상태: {'마감' if state.closed else '모집 중'}")
     st.button("모집 마감", key="admin_close", on_click=on_close, args=(pool,))
     clicked = st.button("AI 배정", key="admin_assign")
     status_box = st.container(key="assign_status")
-    fresh = run_ai_assignment(pool, status_box, result_slot) if clicked else None
+    fresh = run_ai_assignment(pool, status_box) if clicked else None
     if fresh is None:
         show_assign_status(status_box)
     else:
@@ -515,10 +517,11 @@ def assign_section(pool: db.ReusingConnectionPool, state: State, result_slot) ->
     show_plan(pool, state)
 
 
-def run_ai_assignment(pool: db.ReusingConnectionPool, status_box, result_slot) -> State | None:
+def run_ai_assignment(pool: db.ReusingConnectionPool, status_box) -> State | None:
     """AI 배정 단추. 콜백이 아니라 본문에서 바로 실행하며 진행 상황을 assign_status에 그린다(몇 분 걸릴 수 있음).
 
     배정을 시작했으면 그때 읽은 상태를, 시작하지 못했으면(관리자 아님, 마감 전, DB 오류) None을 돌려준다.
+    결과 문구는 세션에만 넣고, result에는 실행 마지막에 fill_result가 그린다(기다리는 동안은 지난 결과가 보인다).
     AI를 기다리는 동안에는 DB 연결이나 트랜잭션을 쥐고 있지 않는다.
     """
     user_id = st.session_state.get(USER_ID)
@@ -537,7 +540,6 @@ def run_ai_assignment(pool: db.ReusingConnectionPool, status_box, result_slot) -
         return None
 
     clear_plan()
-    result_slot.caption("AI 배정 중... 끝나면 결과가 여기에 나옴")
     wait_slot = status_box.empty()
 
     def on_wait(order: int, model: str, elapsed: float) -> None:
@@ -584,16 +586,17 @@ def show_assign_status(status_box) -> None:
         show_problems(problems)
 
 
-def show_problems(problems: Sequence[str]) -> None:
-    """배정안을 만들지 못한 이유(지금 컨테이너 안에 그린다)."""
-    if not problems:
-        return
+def problem_lines(problems: Sequence[str]) -> list[str]:
+    """배정안을 만들지 못한 이유를 assign_status의 줄로: 이유마다 "규칙을 지키는 배정이 없음: {이유}"(PRD 5.3)."""
     if list(problems) == [NO_STUDENTS]:
-        st.markdown(NO_STUDENTS)
-        return
-    st.markdown(NO_VALID_ASSIGNMENT)
-    for problem in problems:
-        st.markdown(f"- {md(problem)}")
+        return [NO_STUDENTS]
+    return [f"{NO_VALID_ASSIGNMENT}: {md(problem)}" for problem in problems]
+
+
+def show_problems(problems: Sequence[str]) -> None:
+    """배정안을 만들지 못한 이유(지금 컨테이너 안에 한 줄씩 그린다)."""
+    for line in problem_lines(problems):
+        st.markdown(line)
 
 
 def show_plan(pool: db.ReusingConnectionPool, state: State) -> None:
