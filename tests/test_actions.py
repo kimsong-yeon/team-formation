@@ -253,15 +253,23 @@ class MemoryRepoTests(RepoTestCase):
         custom = MemoryRepo(admin_password="비밀", hasher=lambda p: p[::-1])
         self.assertEqual(custom.find_account("admin").password_hash, "밀비")
 
-    def test_reset_numbers_students_from_1_in_roster_order(self):
+    def test_student_ids_follow_roster_order_and_are_never_reused_after_reset(self):
         self.reset()
-        self.assertEqual([s.id for s in self.repo.load_state().students.values()], list(range(1, 9)))
+        first_ids = [s.id for s in self.repo.load_state().students.values()]
+        self.assertEqual(first_ids, list(range(1, 9)))  # 처음에는 명단 순서대로 1부터
         account = self.repo.get_account(3)
         self.assertEqual((account.student_no, account.is_admin), ("2026103", False))
         self.assertEqual(self.repo.find_account("2026103"), account)
-        self.reset(team_count=2)  # 다시 올려도 1부터
-        self.assertEqual(self.repo.get_account(1).student_no, "2026101")
-        self.assertEqual(self.repo.get_account(0).is_admin, True)
+        self.reset(team_count=2)
+        # 다시 올리면 예전 id는 모두 없어지고, 새 학생의 id는 예전 id보다 모두 크다
+        second_ids = [s.id for s in self.repo.load_state().students.values()]
+        self.assertEqual(len(second_ids), 8)
+        self.assertGreater(min(second_ids), max(first_ids))
+        self.assertEqual(second_ids, sorted(second_ids))  # 명단 순서
+        for old_id in first_ids:
+            self.assertIsNone(self.repo.get_account(old_id))
+        self.assertEqual(self.repo.get_account(second_ids[0]).student_no, "2026101")
+        self.assertEqual(self.repo.get_account(0).is_admin, True)  # 관리자는 id 0 그대로
 
     def test_add_member_takes_smallest_free_slot(self):
         self.reset()
@@ -303,11 +311,12 @@ class MemoryRepoTests(RepoTestCase):
         a = self.repo.insert_application(1, 1, "대기", "")
         b = self.repo.insert_application(1, 2, "대기", "")
         self.reset()
-        c = self.repo.insert_application(1, 1, "대기", "")
+        student = min(self.repo.load_state().students)  # 학생 id도 다시 쓰지 않으므로 처음 학생의 id가 1이 아니다
+        c = self.repo.insert_application(1, student, "대기", "")
         self.assertEqual((a, b, c), (1, 2, 3))
         apps = {x.id: x for x in self.repo.load_state().applications}
         self.assertEqual(list(apps), [3])
-        self.repo.insert_application(1, 2, "대기", "")
+        self.repo.insert_application(1, student + 1, "대기", "")
         times = [x.created_at for x in self.repo.load_state().applications]
         self.assertEqual(times, sorted(set(times)))
 

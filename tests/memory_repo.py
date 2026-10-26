@@ -40,6 +40,7 @@ class MemoryRepo(Repo):
         self._votes: dict[int, dict[int, str]] = {}
         self._closed = False
         self._last_application_id = 0  # 명단을 다시 올려도 되돌리지 않는다
+        self._last_student_id = 0  # 학생 id도 되돌리지 않는다(예전 로그인이 새 학생의 계정이 되면 안 됨)
 
     # ---- 읽기 ----
     def load_state(self) -> State:
@@ -120,7 +121,9 @@ class MemoryRepo(Repo):
             raise ValueError("학생 수와 비밀번호 해시 수가 다름")
         self._accounts = {0: self._admin}
         self._students = {}
-        for student_id, (row, password_hash) in enumerate(zip(rows, password_hashes), start=1):
+        for row, password_hash in zip(rows, password_hashes):
+            self._last_student_id += 1
+            student_id = self._last_student_id
             self._students[student_id] = Student(
                 student_id, row.student_no, row.name, row.main_role, tuple(row.sub_roles)
             )
