@@ -205,14 +205,17 @@ def close(repo: Repo, actor_id: int) -> Outcome:
 
 
 def confirm(repo: Repo, actor_id: int, plan: dict[int, int]) -> Outcome:
-    """관리자가 배정안(학생 id -> 팀 id)을 확정한다. 지금 상태로 한 번 더 검사해서 통과해야 한다."""
+    """관리자가 배정안(학생 id -> 팀 id)을 확정한다. 지금 상태로 한 번 더 검사해서 통과해야 한다.
+
+    빈 배정안은 팀이 없는 학생이 없을 때만 받는다(지금 팀이 모두 규칙을 지키면 0명 확정).
+    """
     blocked = _require_admin(repo, actor_id)
     if blocked is not None:
         return blocked
     state = repo.load_state()
     if not state.closed:
         return Outcome(BLOCKED, "모집을 먼저 마감해야 합니다")
-    if not plan:
+    if not plan and state.unassigned():
         return Outcome(BLOCKED, "확정할 배정안이 없습니다")
     pairs = sorted(plan.items())
     if validate_plan(state, pairs):

@@ -233,6 +233,36 @@ class CloseAndConfirmTests(RepoTestCase):
         self.assertEqual(actions.confirm(repo, admin_id, {ids["학생2(PL;PT)"]: 9}).text, stale)  # 없는 팀
         self.assertEqual(repo.load_state(), before)
 
+    EVERYONE_IN_TEAMS = {1: [1, 4, 7], 2: [2, 5, 8], 3: [3, 6]}  # 쉬움 명단 8명이 모두 규칙을 지키는 팀에 있음
+
+    def place_everyone(self, team_count=3, closed=True):
+        """쉬움 명단(팀 team_count개)의 학생 모두를 EVERYONE_IN_TEAMS대로 팀에 바로 넣는다."""
+        self.reset(team_count=team_count)
+        for team_id, numbers in self.EVERYONE_IN_TEAMS.items():
+            for n in numbers:
+                self.repo.add_member(team_id, self.repo.find_account(f"2026{100 + n}").id)
+        if closed:
+            self.repo.set_closed()
+        state = self.repo.load_state()
+        self.assertEqual(state.unassigned(), [])
+        return state
+
+    def test_confirm_empty_plan_when_nobody_is_unassigned_and_teams_are_valid(self):
+        before = self.place_everyone()
+        outcome = actions.confirm(self.repo, self.admin_id, {})
+        self.assertEqual(outcome.text, "승인: 배정안을 확정했습니다 (0명)")
+        self.assertEqual(self.repo.load_state(), before)  # 쓸 것이 없다
+
+    def test_confirm_empty_plan_is_blocked_when_teams_break_rules(self):
+        before = self.place_everyone(team_count=4)  # 팀4가 비어 있다(2~4명, 필수 역할을 못 지킴)
+        stale = "막힘: 배정안을 만든 뒤 상태가 바뀌었습니다. AI 배정을 다시 해 주세요"
+        self.assertEqual(actions.confirm(self.repo, self.admin_id, {}).text, stale)
+        self.assertEqual(self.repo.load_state(), before)
+
+    def test_confirm_empty_plan_needs_closed_recruitment(self):
+        self.place_everyone(closed=False)
+        self.assertEqual(actions.confirm(self.repo, self.admin_id, {}).text, "막힘: 모집을 먼저 마감해야 합니다")
+
     def test_confirm_success_adds_members_and_counts_them(self):
         repo, ids, admin_id = replay_until(EASY, ("close", "승인"))
         plan = {ids["학생7(FD;PT)"]: 1, ids["학생8(TT;RW;PT)"]: 2}

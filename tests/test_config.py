@@ -77,13 +77,13 @@ class GetSecretTests(ConfigTestCase):
 
     def test_dotenv_with_bom_is_read_literally_and_environment_wins(self):
         self.env_file.write_text(
-            "DATABASE_URL=postgresql://file\nOPENROUTER_API_KEY=sk-${HOME}\nADMIN_PASSWORD=from-file\n",
+            "DATABASE_URL=postgresql://file\nOPENROUTER_API_KEY=sk-${HOME}\nADMIN_PASSWORD=FAKE-TEST-ONLY-FILE\n",
             encoding="utf-8-sig",  # 메모장의 BOM
         )
-        os.environ["ADMIN_PASSWORD"] = "from-env"
+        os.environ["ADMIN_PASSWORD"] = "FAKE-TEST-ONLY-ENV"
         self.assertEqual(config.get_secret("DATABASE_URL"), "postgresql://file")
         self.assertEqual(config.get_secret("OPENROUTER_API_KEY"), "sk-${HOME}")
-        self.assertEqual(config.get_secret("ADMIN_PASSWORD"), "from-env")
+        self.assertEqual(config.get_secret("ADMIN_PASSWORD"), "FAKE-TEST-ONLY-ENV")
 
     def test_dotenv_is_loaded_once(self):
         with mock.patch("dotenv.load_dotenv") as load:
@@ -125,13 +125,14 @@ class StreamlitSecretsTests(ConfigTestCase):
 
 class SecretStatusTests(ConfigTestCase):
     def test_status_has_only_presence(self):
-        os.environ["DATABASE_URL"] = "postgresql://user:very-secret@host/db"
-        os.environ["ADMIN_PASSWORD"] = "admin-very-secret"
+        os.environ["DATABASE_URL"] = "postgresql://user:FAKEPW@db.example.invalid/db"
+        os.environ["ADMIN_PASSWORD"] = "FAKE-TEST-ONLY"
         status = config.secret_status()
         self.assertEqual(
             status, {"DATABASE_URL": "있음", "OPENROUTER_API_KEY": "없음", "ADMIN_PASSWORD": "있음"}
         )
-        self.assertNotIn("very-secret", repr(status))
+        self.assertNotIn("FAKEPW", repr(status))
+        self.assertNotIn("FAKE-TEST-ONLY", repr(status))
 
     def test_check_env_script_prints_one_line_per_name(self):
         # 저장소 밖 임시 폴더에 같은 구조로 복사해 실행한다(실제 .env를 읽지 않도록).
@@ -143,7 +144,7 @@ class SecretStatusTests(ConfigTestCase):
         shutil.copy(ROOT / "teamapp" / "config.py", tmp / "teamapp" / "config.py")
         shutil.copy(ROOT / "scripts" / "check_env.py", tmp / "scripts" / "check_env.py")
         (tmp / ".env").write_text(
-            "DATABASE_URL=postgresql://user:very-secret@host/db\nADMIN_PASSWORD=admin-very-secret\n",
+            "DATABASE_URL=postgresql://user:FAKEPW@db.example.invalid/db\nADMIN_PASSWORD=FAKE-TEST-ONLY\n",
             encoding="utf-8",
         )
         env = {k: v for k, v in os.environ.items() if k not in config.SECRET_NAMES and k != "PYTHONPATH"}
@@ -161,7 +162,8 @@ class SecretStatusTests(ConfigTestCase):
         self.assertEqual(
             stdout.splitlines(), ["DATABASE_URL: 있음", "OPENROUTER_API_KEY: 없음", "ADMIN_PASSWORD: 있음"]
         )
-        self.assertNotIn("very-secret", stdout + stderr)
+        self.assertNotIn("FAKEPW", stdout + stderr)
+        self.assertNotIn("FAKE-TEST-ONLY", stdout + stderr)
 
 
 if __name__ == "__main__":

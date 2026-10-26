@@ -106,8 +106,8 @@ class InvariantTests(unittest.TestCase):
         if plan:
             self.assertEqual(actions.confirm(repo, 0, plan).kind, APPROVED)
             tally["확정"] += 1
-        else:  # 팀이 없는 학생이 없으면 확정할 것이 없다
-            self.assertEqual(actions.confirm(repo, 0, plan).text, "막힘: 확정할 배정안이 없습니다")
+        else:  # 팀이 없는 학생이 없고 지금 팀이 모두 규칙을 지키면 빈 배정안을 그대로 확정한다
+            self.assertEqual(actions.confirm(repo, 0, plan).text, "승인: 배정안을 확정했습니다 (0명)")
             tally["이미 모두 팀 있음"] += 1
         final = repo.load_state()
         self.assertEqual(final.unassigned(), [])

@@ -2,6 +2,7 @@
 
 - 화면 요소는 채점 프로그램처럼 Streamlit key로만 찾는다(PRD 5.4절 표).
 - TextHelperTests(글 만들기 함수)는 streamlit과 psycopg2만 있으면 돌고, 없으면 건너뛴다.
+- AdminLoginSyncTests(관리자 로그인 전 비밀번호 해시 맞추기)는 가짜 streamlit과 가짜 DB로 언제나 돈다.
 - ScreenTests는 bcrypt와 .env(또는 환경 변수)의 DATABASE_URL, ADMIN_PASSWORD도 있어야 하고, 없으면 건너뛴다.
 - 주의: test_db처럼 DATABASE_URL이 가리키는 DB의 tf_ 데이터(관리자를 뺀 학생, 팀, 팀원, 지원, 투표, 마감 표시)를
   지우고 명단을 다시 올린다. 테스트하는 동안 관리자 비밀번호 해시를 로컬 ADMIN_PASSWORD에 맞추고, 끝나면 테스트 전
@@ -9,15 +10,22 @@
   그래서 배포한 앱으로 시험하는 도중에는 돌리지 않는다.
 - 실행(수강생 컴퓨터): .venv\\Scripts\\python -m unittest tests.test_app -v
 """
+import contextlib
 import gc
+import importlib.util
+import io
+import sys
+import types
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
-from teamapp import actions, config
+import teamapp
+from teamapp import actions, ai, config  # noqa: F401  ai는 가짜 streamlit으로 앱을 불러오기 전에 먼저 불러 둔다
 from teamapp.passwords import hash_password
 from teamapp.roster import ADMIN_NO
-from teamapp.rules import APPROVED, State, Student
+from teamapp.rules import APPROVED, BLOCKED, Outcome, State, Student
 from tests.scenarios import DATA_DIR
 
 try:
@@ -211,8 +219,8 @@ class TextHelperTests(unittest.TestCase):
             "승인: 검사를 통과한 배정안을 만들었습니다 (출처: 2차 모델(m))",
         )
         self.assertEqual(
-            self.app.assign_result_text(result(None, "", [], ["배정할 학생이 없습니다"])),
-            "막힘: 배정할 학생이 없습니다",
+            self.app.assign_result_text(result({}, "앱(배정할 학생 없음)", ["줄"], [])),
+            "승인: 배정할 학생이 없어 지금 팀 구성이 그대로 확정 대상입니다",
         )
         self.assertEqual(
             self.app.assign_result_text(result(None, "", [], ["팀3에 웹 프로그래머를 맡을 학생이 없음"])),
@@ -220,7 +228,7 @@ class TextHelperTests(unittest.TestCase):
         )
 
     def test_problem_lines(self):
-        self.assertEqual(self.app.problem_lines(["배정할 학생이 없습니다"]), ["배정할 학생이 없습니다"])
+        self.assertEqual(self.app.problem_lines([]), [])
         self.assertEqual(
             self.app.problem_lines(["팀3에 웹 프로그래머를 맡을 학생이 없음", "남은 자리보다 팀이 없는 학생이 많음"]),
             [
@@ -247,6 +255,117 @@ class TextHelperTests(unittest.TestCase):
         self.assertIsNone(self.app.team_count_value(2.5))
         self.assertIsNone(self.app.team_count_value(True))
         self.assertIsNone(self.app.team_count_value(None))
+
+
+def load_app_with_fakes(fake_st, fake_db):
+    """가짜 streamlit과 가짜 teamapp.db를 넣고 streamlit_app.py를 다른 이름으로 불러온다.
+
+    sys.modules의 두 이름과 teamapp.db만 잠깐 바꾸고 되돌린다(진짜 모듈과 그동안 불러온 다른 모듈은 그대로).
+    """
+    fakes = {"streamlit": fake_st, "teamapp.db": fake_db}
+    saved = {name: sys.modules.get(name) for name in fakes}
+    try:
+        sys.modules.update(fakes)
+        with mock.patch.object(teamapp, "db", fake_db, create=True):
+            spec = importlib.util.spec_from_file_location("streamlit_app_with_fakes", APP_PATH)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+    finally:
+        for name, original in saved.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+    return module
+
+
+class AdminLoginSyncTests(unittest.TestCase):
+    """로그인: 학번이 admin이면 로그인 확인 전에 DB의 관리자 해시를 앱 설정의 ADMIN_PASSWORD에 맞춘다.
+
+    로컬 테스트가 같은 DB의 관리자 해시를 바꿔 두어도 배포한 앱의 관리자 비밀번호로 로그인되게 하기 위함이다.
+    streamlit, psycopg2, bcrypt 없이 돈다(가짜 streamlit, 가짜 db, 가짜 actions.login).
+    """
+
+    SECRET = "FAKE-TEST-ONLY"
+
+    def setUp(self):
+        self.events = []
+        self.ensure_error = None
+        self.secrets = {"ADMIN_PASSWORD": self.SECRET}
+
+        fake_st = types.ModuleType("streamlit")
+        fake_st.session_state = {}
+        fake_st.cache_resource = lambda **kwargs: (lambda fn: fn)
+        fake_st.fragment = lambda **kwargs: (lambda fn: fn)
+        fake_st.rerun = lambda: self.events.append(("rerun",))
+
+        fake_db = types.ModuleType("teamapp.db")
+
+        def ensure_admin(pool, admin_password):
+            self.events.append(("ensure_admin", pool, admin_password))
+            if not admin_password:
+                raise ValueError("ADMIN_PASSWORD가 비어 있어 관리자 계정을 만들 수 없습니다")
+            if self.ensure_error is not None:
+                raise self.ensure_error
+
+        @contextlib.contextmanager
+        def read_repo(pool):
+            self.events.append(("read_repo", pool))
+            yield "repo"
+
+        fake_db.ensure_admin = ensure_admin
+        fake_db.read_repo = read_repo
+        self.app = load_app_with_fakes(fake_st, fake_db)
+        self.st = fake_st
+
+        for patcher in (
+            mock.patch.object(self.app.config, "get_secret", side_effect=self.secrets.get),
+            mock.patch.object(self.app.actions, "login", side_effect=self.fake_login),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fake_login(self, repo, student_no, password):
+        self.events.append(("login", student_no))
+        if student_no.strip() == ADMIN_NO and password == self.SECRET:
+            return Outcome(APPROVED, "로그인했습니다"), actions.Account(0, ADMIN_NO, "관리자", "h", True)
+        return Outcome(BLOCKED, actions.LOGIN_FAILED), None
+
+    def log_in(self, student_no, password):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.app.log_in("pool", student_no, password)
+        self.assertEqual((out.getvalue(), err.getvalue()), ("", ""))  # 아무것도 출력하지 않는다
+
+    def test_admin_login_syncs_the_hash_before_checking_the_password(self):
+        self.log_in(" admin ", self.SECRET)
+        self.assertEqual(
+            self.events,
+            [("ensure_admin", "pool", self.SECRET), ("read_repo", "pool"), ("login", " admin "), ("rerun",)],
+        )
+        self.assertEqual(self.st.session_state[self.app.USER_ID], 0)
+
+    def test_sync_failure_is_silent_and_login_goes_on(self):
+        self.ensure_error = RuntimeError(f"connection failed: postgresql://u:{self.SECRET}@db.example.invalid")
+        self.log_in("admin", "틀린 비밀번호")
+        self.assertEqual([e[0] for e in self.events], ["ensure_admin", "read_repo", "login"])
+        self.assertEqual(self.st.session_state[self.app.RESULT], f"막힘: {actions.LOGIN_FAILED}")
+        self.assertNotIn(self.SECRET, repr(self.st.session_state))
+
+    def test_missing_setting_is_silent_and_login_goes_on(self):
+        self.secrets.clear()
+        self.log_in("admin", "아무거나")
+        self.assertEqual(self.events[0], ("ensure_admin", "pool", None))
+        self.assertEqual([e[0] for e in self.events[1:]], ["read_repo", "login"])
+        self.assertEqual(self.st.session_state[self.app.RESULT], f"막힘: {actions.LOGIN_FAILED}")
+
+    def test_student_login_does_not_touch_the_admin_hash(self):
+        for student_no in ("2026101", "administrator", ""):
+            with self.subTest(student_no=student_no):
+                self.events.clear()
+                self.log_in(student_no, "1234")
+                self.assertNotIn("ensure_admin", [e[0] for e in self.events])
+                self.assertIn("login", [e[0] for e in self.events])
 
 
 class ScreenTests(unittest.TestCase):
@@ -407,6 +526,36 @@ class ScreenTests(unittest.TestCase):
         self.assertTrue(self.text_of_key(student1, "result").startswith("승인"), self.text_of_key(student1, "result"))
         self.assert_no_keys(student1, ["vote_yes_2026104", "vote_no_2026104"])
         self.assertIn("학생4(WP;FD)", self.text_of_key(student1, "team_1"))
+
+    def place_everyone_and_close(self, team_count):
+        """쉬움 명단(팀 team_count개)의 학생 8명을 모두 규칙을 지키는 팀 1~3에 넣고 모집을 마감한다."""
+        reset_roster(self.pool, "쉬움.csv", team_count)
+        with db.write_repo(self.pool) as repo:
+            for team_id, numbers in {1: [1, 4, 7], 2: [2, 5, 8], 3: [3, 6]}.items():
+                for n in numbers:
+                    repo.add_member(team_id, repo.find_account(f"2026{100 + n}").id)
+            repo.set_closed()
+
+    def test_nobody_to_assign_confirms_teams_as_they_are(self):
+        """팀이 없는 학생이 없고 팀이 모두 규칙을 지키면 AI를 부르지 않고 빈 배정안을 확정할 수 있다."""
+        self.place_everyone_and_close(3)
+        at = self.log_in(ADMIN_NO, self.admin_password)
+        self.click(at, "admin_assign")
+        self.assertEqual(self.assert_result(at, "승인"), "승인: 배정할 학생이 없어 지금 팀 구성이 그대로 확정 대상입니다")
+        self.assertIn("배정할 학생이 없어 지금 팀 구성을 그대로 확정할 수 있음", self.text_of_key(at, "assign_status"))
+        self.assert_keys(at, ["admin_confirm"])
+        self.click(at, "admin_confirm")
+        self.assertEqual(self.assert_result(at, "승인"), "승인: 배정안을 확정했습니다 (0명)")
+        self.assert_no_keys(at, ["admin_confirm"])
+
+    def test_nobody_to_assign_but_teams_break_rules_shows_reasons(self):
+        """팀이 없는 학생은 없지만 팀4가 비어 있으면 "규칙을 지키는 배정이 없음: 이유"를 보이고 확정 단추가 없다."""
+        self.place_everyone_and_close(4)
+        at = self.log_in(ADMIN_NO, self.admin_password)
+        self.click(at, "admin_assign")
+        self.assertEqual(self.assert_result(at, "막힘"), "막힘: 규칙을 지키는 배정이 없음")
+        self.assertIn("규칙을 지키는 배정이 없음: 팀4에 기획자를 맡을 학생이 없음", self.text_of_key(at, "assign_status"))
+        self.assert_no_keys(at, ["admin_confirm"])
 
     def test_removed_student_is_logged_out(self):
         student1 = self.log_in("2026101", STUDENT_PASSWORD)

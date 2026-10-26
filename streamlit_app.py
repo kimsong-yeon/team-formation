@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 import streamlit as st
 
 from teamapp import actions, ai, config, db
+from teamapp.roster import ADMIN_NO
 from teamapp.rules import (
     APPROVED,
     BLOCKED,
@@ -38,8 +39,8 @@ SETTINGS_MISSING = f"{BLOCKED}: 앱 설정이 없습니다. 관리자에게 알�
 ASSIGN_FAILED = f"{BLOCKED}: 배정하는 중에 문제가 생겼습니다. 다시 시도해 주세요"
 NOT_CLOSED = f"{BLOCKED}: 모집을 먼저 마감해야 합니다"
 NOT_ADMIN = f"{BLOCKED}: {actions.NOT_ADMIN}"
-NO_STUDENTS = "배정할 학생이 없습니다"  # ai.run_assignment가 돌려주는 이유와 같은 글
 NO_VALID_ASSIGNMENT = "규칙을 지키는 배정이 없음"
+NOTHING_TO_ASSIGN = f"{APPROVED}: 배정할 학생이 없어 지금 팀 구성이 그대로 확정 대상입니다"
 NO_RESULT_YET = "단추를 누르면 결과가 여기에 나옴"
 RESULT_KINDS = (APPROVED, PENDING, REJECTED, BLOCKED)
 
@@ -124,11 +125,11 @@ def wait_text(order: int, model: str, elapsed: float) -> str:
 
 
 def assign_result_text(result: ai.AssignResult) -> str:
-    """AI 배정 단추의 결과 문구."""
+    """AI 배정 단추의 결과 문구. 빈 배정안은 팀이 없는 학생이 없고 지금 팀이 모두 규칙을 지킬 때이다."""
     if result.plan is not None:
+        if not result.plan:
+            return NOTHING_TO_ASSIGN
         return f"{APPROVED}: 검사를 통과한 배정안을 만들었습니다 (출처: {result.source})"
-    if result.problems == [NO_STUDENTS]:
-        return f"{BLOCKED}: {NO_STUDENTS}"
     return f"{BLOCKED}: {NO_VALID_ASSIGNMENT}"
 
 
@@ -385,8 +386,25 @@ def login_page(pool: db.ReusingConnectionPool) -> None:
     fill_result(box)
 
 
+def sync_admin_password(pool: db.ReusingConnectionPool) -> None:
+    """DB의 관리자 비밀번호 해시를 앱 설정(Streamlit Secrets)의 ADMIN_PASSWORD에 맞춘다(다르면 갱신).
+
+    같은 DB를 쓰는 로컬 테스트가 관리자 해시를 다른 비밀번호로 바꿔 두었어도, 앱 설정의 비밀번호로 로그인되게 한다.
+    실패해도(설정 없음, DB 오류) 아무것도 알리지 않고 보통 로그인으로 이어 간다(오류 원문은 내보내지 않음).
+    """
+    try:
+        db.ensure_admin(pool, config.get_secret("ADMIN_PASSWORD"))
+    except Exception:
+        pass
+
+
 def log_in(pool: db.ReusingConnectionPool, student_no: str, password: str) -> None:
-    """맞으면 세션에 계정을 넣고 앱을 다시 실행한다. 틀리면 결과 문구만 남긴다."""
+    """맞으면 세션에 계정을 넣고 앱을 다시 실행한다. 틀리면 결과 문구만 남긴다.
+
+    학번이 admin이면 먼저 관리자 비밀번호 해시를 앱 설정에 맞춘다(sync_admin_password).
+    """
+    if (student_no or "").strip() == ADMIN_NO:
+        sync_admin_password(pool)
     try:
         with db.read_repo(pool) as repo:
             outcome, account = actions.login(repo, student_no or "", password or "")
@@ -588,8 +606,6 @@ def show_assign_status(status_box) -> None:
 
 def problem_lines(problems: Sequence[str]) -> list[str]:
     """배정안을 만들지 못한 이유를 assign_status의 줄로: 이유마다 "규칙을 지키는 배정이 없음: {이유}"(PRD 5.3)."""
-    if list(problems) == [NO_STUDENTS]:
-        return [NO_STUDENTS]
     return [f"{NO_VALID_ASSIGNMENT}: {md(problem)}" for problem in problems]
 
 
@@ -600,12 +616,18 @@ def show_problems(problems: Sequence[str]) -> None:
 
 
 def show_plan(pool: db.ReusingConnectionPool, state: State) -> None:
-    """검사를 통과한 배정안이 있으면 표, 출처, 확정 단추."""
+    """검사를 통과한 배정안이 있으면 표, 출처, 확정 단추.
+
+    빈 배정안(배정할 학생이 없고 지금 팀이 모두 규칙을 지킴)도 확정할 수 있게 보여 주고, 표 대신 한 줄을 적는다.
+    """
     plan = st.session_state.get(PLAN)
-    if not plan:
+    if plan is None:
         return
     st.markdown("검사를 통과한 배정안")
-    st.dataframe(plan_rows(state, plan), hide_index=True)
+    if plan:
+        st.dataframe(plan_rows(state, plan), hide_index=True)
+    else:
+        st.markdown(ai.NOTHING_TO_ASSIGN_LINE)
     st.markdown(f"출처: {md(st.session_state.get(PLAN_SOURCE, ''))}")
     st.button("배정안 확정", key="admin_confirm", on_click=on_confirm, args=(pool,))
 

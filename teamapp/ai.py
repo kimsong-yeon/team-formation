@@ -24,7 +24,7 @@ import requests
 from teamapp.rules import PLANNER, TEAM_MAX, TEAM_MIN, WEB, State, Student
 from teamapp.solver import explain_no_assignment, solve, validate_plan
 
-# 1차, 2차, 3차 모델 (모두 :free 모델이며, 무료 모델로 자동 연결하는 openrouter/free는 쓰지 않는다)
+# 1차, 2차, 3차 모델 (모두 :free 모델이며, 무료 모델로 자동 연결하는 오픈라우터의 free 라우터는 쓰지 않는다)
 MODELS: tuple[str, str, str] = (
     "google/gemma-4-31b-it:free",
     "nvidia/nemotron-3-super-120b-a12b:free",
@@ -32,6 +32,10 @@ MODELS: tuple[str, str, str] = (
 )
 TIMEOUT_SECONDS = 120
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# 팀이 없는 학생이 없고 지금 팀이 모두 규칙을 지킬 때의 빈 배정안(지금 팀 구성 그대로 확정)
+NOTHING_TO_ASSIGN_SOURCE = "앱(배정할 학생 없음)"
+NOTHING_TO_ASSIGN_LINE = "배정할 학생이 없어 지금 팀 구성을 그대로 확정할 수 있음"
 
 # requests의 (연결, 읽기) 제한. 읽기 제한은 한 번 기다리는 시간이라 전체 120초 제한은 run_with_deadline이 맡는다.
 _REQUEST_TIMEOUT = (10, 130)
@@ -57,7 +61,8 @@ class ModelFailure(Exception):
 class AssignResult:
     """배정 결과.
 
-    plan: 학생 id -> 팀 id (배정할 수 없으면 None), source: 어디서 나온 배정인지,
+    plan: 학생 id -> 팀 id (배정할 수 없으면 None, 배정할 학생이 없고 팀이 모두 규칙을 지키면 {}),
+    source: 어디서 나온 배정인지,
     lines: 모델마다 남긴 줄, problems: plan이 None일 때의 이유 목록.
     """
 
@@ -323,21 +328,29 @@ def run_assignment(
 ) -> AssignResult:
     """팀이 없는 학생의 배정을 만든다: 규칙을 지키는 배정이 있는지 보고, AI 1차 -> 2차 -> 3차, 마지막에 앱.
 
+    팀이 없는 학생이 없으면 모델을 부르지 않는다: 지금 팀이 모두 규칙을 지키면 빈 배정안({}),
+    아니면 plan=None과 이유(explain_no_assignment).
     on_line(줄): 줄이 만들어지는 대로 부른다. on_wait(몇 차, 모델, 기다린 초): 모델마다 요청 전에 0초로,
     기다리는 동안은 1초마다 부른다.
     """
-    if not state.unassigned():
-        return AssignResult(None, "", [], ["배정할 학생이 없습니다"])
-    # 규칙을 지키는 배정이 없으면 AI를 부르지 않는다(호출 횟수를 아낌).
-    if solve(state) is None:
-        return AssignResult(None, "", [], explain_no_assignment(state))
-
-    messages = build_messages(state)
     lines: list[str] = []
 
     def log(line: str) -> None:
         lines.append(line)
         on_line(line)
+
+    # 팀이 없는 학생이 없으면 AI를 부르지 않는다. 지금 팀이 모두 규칙을 지키면 빈 배정안(지금 팀 구성 그대로)을
+    # 확정할 수 있게 돌려주고, 아니면 "규칙을 지키는 배정이 없음"의 이유를 돌려준다.
+    if not state.unassigned():
+        if validate_plan(state, []):
+            return AssignResult(None, "", [], explain_no_assignment(state))
+        log(NOTHING_TO_ASSIGN_LINE)
+        return AssignResult({}, NOTHING_TO_ASSIGN_SOURCE, lines, [])
+    # 규칙을 지키는 배정이 없으면 AI를 부르지 않는다(호출 횟수를 아낌).
+    if solve(state) is None:
+        return AssignResult(None, "", [], explain_no_assignment(state))
+
+    messages = build_messages(state)
 
     for order, model in enumerate(models, start=1):
         label = f"{order}차 모델({model})"

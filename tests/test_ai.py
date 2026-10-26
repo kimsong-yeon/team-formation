@@ -21,7 +21,7 @@ from teamapp.ai import (
     run_with_deadline,
 )
 from teamapp.rules import ROLES, State, Student
-from teamapp.solver import validate_plan
+from teamapp.solver import explain_no_assignment, validate_plan
 
 PL, WP, FD, TT, RW, PT = ROLES
 API_KEY = "sk-or-test-SECRET-1234567890"
@@ -107,7 +107,7 @@ class ModelsTest(unittest.TestCase):
         )
         for model in MODELS:
             self.assertTrue(model.endswith(":free"))
-            self.assertNotEqual(model, "openrouter/free")
+            self.assertNotEqual(model, "openrouter" + "/free")  # 무료 자동 연결 라우터가 아님
         self.assertEqual(TIMEOUT_SECONDS, 120)
         self.assertEqual(OPENROUTER_URL, "https://openrouter.ai/api/v1/chat/completions")
 
@@ -542,14 +542,43 @@ class RunAssignmentTest(unittest.TestCase):
         self.assertIn("팀을 2명 이상으로 채울 학생이 모자람", result.problems[0])
         self.assertEqual(result.lines, [])
 
-    def test_nobody_to_assign_skips_ai(self):
-        students = [S(1, PL), S(2, WP)]
-        state = make_state(students, {1: [1, 2]}, teams=1)
+    def test_nobody_to_assign_with_valid_teams_gives_empty_plan_without_ai(self):
+        # 팀이 없는 학생이 없고 지금 팀이 모두 규칙을 지킴: 빈 배정안을 확정할 수 있다.
+        students = [S(1, PL), S(2, WP), S(3, PL, TT), S(4, WP), S(5, FD)]
+        state = make_state(students, {1: [1, 2], 2: [3, 4, 5]}, teams=2)
         fake = FakeCall()
-        result, _ = self.run_it(state, fake)
+        result, waits = self.run_it(state, fake)
         self.assertEqual(fake.calls, [])
+        self.assertEqual(waits, [])
+        self.assertEqual(result.plan, {})
+        self.assertEqual(result.source, "앱(배정할 학생 없음)")
+        self.assertEqual(result.lines, ["배정할 학생이 없어 지금 팀 구성을 그대로 확정할 수 있음"])
+        self.assertEqual(result.problems, [])
+
+    def test_nobody_to_assign_with_invalid_teams_explains_without_ai(self):
+        # 팀이 없는 학생은 없지만 팀2에는 필수 역할이 없고 팀3은 비어 있다: 규칙을 지키는 배정이 없음과 이유.
+        students = [S(1, PL), S(2, WP), S(3, FD), S(4, TT)]
+        state = make_state(students, {1: [1, 2], 2: [3, 4]}, teams=3)
+        fake = FakeCall()
+        with mock.patch.object(ai, "solve", side_effect=AssertionError("solve를 부르면 안 됨")):
+            result, waits = self.run_it(state, fake)
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(waits, [])
         self.assertIsNone(result.plan)
-        self.assertEqual(result.problems, ["배정할 학생이 없습니다"])
+        self.assertEqual(result.lines, [])
+        self.assertEqual(result.problems, explain_no_assignment(state))
+        self.assertEqual(
+            result.problems,
+            [
+                "팀2에 기획자를 맡을 학생이 없음",
+                "팀2에 웹 프로그래머를 맡을 학생이 없음",
+                "팀3에 기획자를 맡을 학생이 없음",
+                "팀3에 웹 프로그래머를 맡을 학생이 없음",
+                "팀을 2명 이상으로 채울 학생이 모자람 (필요 2명, 있음 0명)",
+                "기획자를 맡을 학생이 모자람 (필요 2명, 가능 0명)",
+                "웹 프로그래머를 맡을 학생이 모자람 (필요 2명, 가능 0명)",
+            ],
+        )
 
     def test_timeout_cuts_off_slow_model_and_moves_on(self):
         state = easy_state()

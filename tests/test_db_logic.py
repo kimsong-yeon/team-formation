@@ -403,11 +403,11 @@ class PoolTests(DbLogicTestCase):
 
 class ConnectFailureTests(DbLogicTestCase):
     CASES = {
-        'could not translate host name "ss@aws-0.pooler.supabase.com" to address: Name or service not known':
+        'could not translate host name "FAKEPW@db.example.invalid" to address: Name or service not known':
             "주소/포트 오류",
-        'invalid integer value "ss@5432" for connection option "port"': "주소/포트 오류",
+        'invalid integer value "FAKEPW@5432" for connection option "port"': "주소/포트 오류",
         'connection to server at "h" (1.2.3.4), port 5432 failed: timeout expired': "시간 초과",
-        'connection to server at "h", port 5432 failed: FATAL:  password authentication failed for user "pw-ss"':
+        'connection to server at "h", port 5432 failed: FATAL:  password authentication failed for user "FAKEPW"':
             "인증 실패",
         "connection to server at \"h\", port 5432 failed: FATAL:  Tenant or user not found": "인증 실패",
         'connection to server at "h", port 5432 failed: Connection refused': "연결 실패",
@@ -426,12 +426,12 @@ class ConnectFailureTests(DbLogicTestCase):
             with self.subTest(reason=reason, text=text[:30]):
                 with mock.patch.object(PG, "connect_factory", side_effect=PG.OperationalError(text)):
                     with self.assertRaises(PG.OperationalError) as caught:
-                        db.make_pool("postgresql://u:pw-ss@aws-0.pooler.supabase.com:5432/postgres")
+                        db.make_pool("postgresql://u:FAKEPW@db.example.invalid:5432/postgres")
                 self.assert_generic(caught, reason)
-                self.assertNotIn("ss", str(caught.exception))
+                self.assertNotIn("FAKEPW", str(caught.exception))
 
     def test_new_connection_failure_in_connection_is_generic(self):
-        text = 'could not translate host name "ss@h" to address'
+        text = 'could not translate host name "FAKEPW@h" to address'
         pool = FakePool([], error=PG.OperationalError(text))
         with self.assertRaises(PG.OperationalError) as caught:
             with db.connection(pool):
@@ -439,10 +439,10 @@ class ConnectFailureTests(DbLogicTestCase):
         self.assert_generic(caught, "주소/포트 오류")
 
     def test_malformed_url_error_does_not_show_the_url(self):
-        secret_error = PG.ProgrammingError('invalid dsn: unexpected character in URI: "postgresql://u:pw-secret@h"')
+        secret_error = PG.ProgrammingError('invalid dsn: unexpected character in URI: "postgresql://u:FAKEPW@h"')
         with mock.patch.object(PG, "connect_factory", side_effect=secret_error):
             with self.assertRaises(ValueError) as caught:
-                db.make_pool("postgresql://u:pw-secret@h")
+                db.make_pool("postgresql://u:FAKEPW@h")
         self.assertEqual(str(caught.exception), "DATABASE_URL 형식이 맞지 않습니다")
         self.assertIsNone(caught.exception.__context__)
 
